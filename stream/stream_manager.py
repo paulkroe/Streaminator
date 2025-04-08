@@ -4,10 +4,10 @@ import torch
 import json
 from collections import deque
 from torch.nn.utils.rnn import pad_sequence
-from prompt_sampler import PromptSampler
-from kv_cache_manager import KVCacheManager
-from kv_cache_wrapper import KVCacheWrapper
-from sequence import Sequence
+from .prompt_sampler import PromptSampler
+from .kv_cache_manager import KVCacheManager
+from .kv_cache_wrapper import KVCacheWrapper
+from .sequence import Sequence
 
 class StreamManager:
     def __init__(

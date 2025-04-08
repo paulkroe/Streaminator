@@ -18,3 +18,5 @@ support more models->kv cache wrapper
 
 ## main ideas:
 implement ngrams to see if they work
+
+## first i want to make sure the pipeline works. that means we should have a pass@8 score around 75% on gsm8k with llama 3.2 1B 

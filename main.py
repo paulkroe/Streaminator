@@ -2,7 +2,7 @@
 import time
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from stream_manager import StreamManager
+from stream import StreamManager
 import textwrap
 from string import Template
 
