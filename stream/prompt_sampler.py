@@ -4,7 +4,7 @@ import torch
 
 class PromptSampler:
     @staticmethod
-    def sample_token(logits, temperature=1.0, top_k=1, top_p=0.97):
+    def sample_token(logits, temperature=1.0, top_k=1, top_p=0.95):
         # logits: torch.Tensor of shape [vocab_size]
         if temperature != 1.0:
             logits = logits / temperature
