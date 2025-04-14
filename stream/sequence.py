@@ -48,7 +48,7 @@ class Sequence:
         Decode the generation up to EOS (if present) or up to the final token.
         """
         if self.finished_pos is not None:
-            # decode only up to the eos token (exclusive or inclusive as you prefer)
+            # decode only up to the eos token
             valid_gens = self.generated_tokens[: self.finished_pos + 1]
         else:
             valid_gens = self.generated_tokens

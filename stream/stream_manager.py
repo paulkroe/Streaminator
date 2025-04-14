@@ -96,51 +96,57 @@ class StreamManager:
 
         # return a list of (possibly) multiple sequences if you want num_completions>1
         return [seq]
-
-    def _align_new_sequence(self, seq):
-        """
-        Align a new sequence's KV cache with the current active sequences.
-        When a new prompt is added, if there are already active sequences,
-        pad this new sequence’s KV cache (along the time dimension) so that it
-        matches the maximum valid length among the active sequences.
-        """
-        if not self.active_seqs:
-            # No active sequences exist; nothing to align.
-            return seq
-
-        current_max_len = max(s.get_valid_length() for s in self.active_seqs)
-        seq_valid_len = seq.get_valid_length()
-        if seq_valid_len < current_max_len:
-            pad_size = current_max_len - seq_valid_len
-            new_cache = []
-            for (k, v) in seq.kv_cache:
-                # Left-pad the time dimension (dimension 2)
-                k = torch.nn.functional.pad(k, (0, 0, pad_size, 0), "constant", 0)
-                v = torch.nn.functional.pad(v, (0, 0, pad_size, 0), "constant", 0)
-                new_cache.append((k, v))
-            seq.kv_cache = new_cache
-        return seq
-
+    
     def _refill_active_seqs(self):
-        while len(self.active_seqs) < self.stream_width and self.prompt_deque:
-            if len(self.prompt_deque) > 1:
-                prompt_text, count = self.prompt_deque.popleft()
-                new_seqs = self._prefill_prompt(prompt_text, 1)
-                for seq in new_seqs:
-                    aligned_seq = self._align_new_sequence(seq)
-                    self.active_seqs.append(aligned_seq)
-                if count > 1:
-                    self.prompt_deque.append((prompt_text, count - 1))
-            else:
-                prompt_text, count = self.prompt_deque[0]
-                new_seqs = self._prefill_prompt(prompt_text, 1)
-                for seq in new_seqs:
-                    aligned_seq = self._align_new_sequence(seq)
-                    self.active_seqs.append(aligned_seq)
-                if count > 1:
-                    self.prompt_deque[0] = (prompt_text, count - 1)
-                else:
-                    self.prompt_deque.popleft()
+        # Step 1: Determine how many new sequences are needed.
+        num_active = len(self.active_seqs)
+        num_new_needed = self.stream_width - num_active
+
+        # Step 2: For all currently active sequences, trim their KV caches to contain only the valid tokens.
+        # This step removes previously added left-padding (and the corresponding dummy values) from the KV caches.
+        for seq in self.active_seqs:
+            valid_length = seq.get_valid_length()
+            trimmed_kv = []
+            for (k, v) in seq.kv_cache:
+                # k and v are assumed to have shape [1, num_heads, seq_len, head_dim].
+                # Here we extract only the last 'valid_length' tokens along the time dimension.
+                trimmed_k = k[..., -valid_length:, :]
+                trimmed_v = v[..., -valid_length:, :]
+                trimmed_kv.append((trimmed_k, trimmed_v))
+            seq.kv_cache = trimmed_kv
+
+        # Step 3: Add new sequences from the prompt deque until we have enough to fill the stream.
+        for _ in range(num_new_needed):
+            if not self.prompt_deque:
+                break
+            # Pop one prompt (handling count > 1)
+            prompt_text, count = self.prompt_deque.popleft()
+            new_seqs = self._prefill_prompt(prompt_text, 1)
+            for new_seq in new_seqs:
+                self.active_seqs.append(new_seq)
+            if count > 1:
+                # Reinsert with a decremented count.
+                self.prompt_deque.append((prompt_text, count - 1))
+        
+        # Step 4: Determine the maximum valid length among all active sequences.
+        if self.active_seqs:
+            max_valid_length = max(seq.get_valid_length() for seq in self.active_seqs)
+        else:
+            max_valid_length = 0
+
+        # Step 5: Left-pad all active sequences' KV caches to match the maximum valid length.
+        # For sequences that are shorter, add dummy (zeroed) tensors on the left.
+        for seq in self.active_seqs:
+            current_valid_length = seq.get_valid_length()
+            pad_size = max_valid_length - current_valid_length
+            if pad_size > 0:
+                padded_kv = []
+                for (k, v) in seq.kv_cache:
+                    # Pad on the left along the time dimension (assumed dim=2)
+                    padded_k = torch.nn.functional.pad(k, (0, 0, pad_size, 0), mode="constant", value=0)
+                    padded_v = torch.nn.functional.pad(v, (0, 0, pad_size, 0), mode="constant", value=0)
+                    padded_kv.append((padded_k, padded_v))
+                seq.kv_cache = padded_kv
 
     def _get_batched_kv(self):
         """
@@ -180,6 +186,7 @@ class StreamManager:
             return None
 
         max_seq_len = max(seq.get_valid_length() for seq in self.active_seqs)
+        print(f"max_seq_len: {max_seq_len}")
         if max_seq_len == 0:
             return None
 
@@ -198,16 +205,24 @@ class StreamManager:
         # 1. Collect "last token" for each sequence.
         input_tokens = []
         positions = []
-        for i, seq in enumerate(self.active_seqs):
+        num_idle_seqs = 0
+        for seq in self.active_seqs:
             last_tok = seq.next_input_token()
             if last_tok is None:
                 last_tok = self.tokenizer.eos_token_id
+                print("almost idle")
             if seq.is_finished():
                 last_tok = self.tokenizer.eos_token_id
-                print(f"====================Sequence finished, using EOS token: {last_tok} for {i}==============================")
+                num_idle_seqs += 1
+                print("idle")
             input_tokens.append(last_tok)
-            pos = len(seq.prompt_tokens) + len(seq.generated_tokens) - 1
+            pos = len(seq.prompt_tokens) + len(seq.generated_tokens)
             positions.append(max(pos, 0))
+        print(len(self.active_seqs), self.stream_width, num_idle_seqs)
+        if num_idle_seqs == len(self.active_seqs):
+            # All sequences are finished (past their eos); nothing to generate.
+            return None, None
+        print("----")
 
         input_ids = torch.tensor(input_tokens, dtype=torch.long, device=self.device).unsqueeze(1)
         position_ids = torch.tensor(positions, dtype=torch.long, device=self.device).unsqueeze(1)
@@ -218,11 +233,9 @@ class StreamManager:
             return None, None
 
         past_for_model = KVCacheWrapper.wrap(batched_kv, self.model)
-        print(f"past_for_model shape: {past_for_model[0][0].shape}")
 
         # 3. Build the attention mask and add one extra column for the new token.
         attention_mask = self._build_leftpad_attention_mask()
-        print(f"attention_mask shape: {attention_mask.shape}")
         if attention_mask is None:
             return None, None
         token_mask = torch.ones(attention_mask.size(0), 1, dtype=attention_mask.dtype, device=attention_mask.device)
@@ -240,7 +253,6 @@ class StreamManager:
         # 4. Re-split the new past KV into a list per sequence.
         logits_full = outputs.logits  # shape [B, 1, vocab_size]
         new_past_full = outputs.past_key_values
-        print(f"new_past_full shape: {new_past_full[1][0].shape}")
         batch_size = len(self.active_seqs)
 
         new_past_list = []
@@ -251,7 +263,6 @@ class StreamManager:
                 v_layer = new_past_full[layer_i][1][i].unsqueeze(0)
                 seq_past.append((k_layer, v_layer))
             new_past_list.append(seq_past)
-        print(f"new_past_list[0][1][0] shape: {new_past_list[0][1][0].shape}")
 
         return logits_full[:, -1, :], new_past_list
 
@@ -292,62 +303,76 @@ class StreamManager:
         self.save_results("generation_results.json")
 
     def _run_generation_continuous(self):
+        # Initially, try to refill the active batch.
         self._refill_active_seqs()
         step_counter = 0
 
+        # Continue until there are no active sequences and no prompts waiting.
         while self.active_seqs or self.prompt_deque:
-            if step_counter % self.refill_period == 0:
-                # Remove finished sequences and store final results.
+
+            # Every 'refill_period' steps, process finished sequences and refill.
+            if step_counter % self.refill_period == 0:               
                 still_active = []
                 for seq in self.active_seqs:
-                    if not seq.is_finished():
-                        still_active.append(seq)
-                    else:
-                        gen_text = self.tokenizer.decode(seq.get_final_generation(), skip_special_tokens=True)
+                    # Here we check if the sequence has ever generated an EOS token.
+                    # This assumes that seq.generated_tokens is a list/tensor of token IDs.
+                    if self.tokenizer.eos_token_id in seq.generated_tokens or seq.is_finished():
+                        # Trim the sequence to only include tokens up to (and including) the first EOS.
+                        trimmed_tokens = seq.get_final_generation()
+                        gen_text = self.tokenizer.decode(trimmed_tokens, skip_special_tokens=True)
                         if seq.prompt_text not in self.results:
                             self.results[seq.prompt_text] = []
                         self.results[seq.prompt_text].append(gen_text)
+                        # Do not add this sequence back into still_active.
+                    else:
+                        # If no EOS has been generated, continue working on this sequence.
+                        still_active.append(seq)
+
+                # Update the active sequences: finished ones have been removed.
                 self.active_seqs = still_active
-
-                # Refill active sequences up to stream_width.
+                # Refill active sequences up to stream_width (i.e. add new prompts as needed).
                 self._refill_active_seqs()
-
+                for seq in still_active:
+                    print(f"{len(seq.generated_tokens)} / {seq.max_length} tokens generated")
+                print("---")
+            # If there are no sequences left, simply advance the step counter.
             if not self.active_seqs:
                 step_counter += 1
                 continue
 
+            # Generate one token for each sequence.
+            # Notice we do not check here if a sequence is finished;
+            # we always sample and append a new token.
             if self.use_kv_cache:
                 logits, new_past_list = self._generate_step_with_kv()
             else:
                 logits, new_past_list = self._generate_step_without_kv()
 
+            # If generation returned nothing, skip this step.
             if logits is None:
                 step_counter += 1
                 continue
 
+            # For every active sequence, sample and append the new token.
+            # Even if a sequence already contains an EOS, we continue appending (and later trim).
             for i, seq in enumerate(self.active_seqs):
-                if not seq.is_finished():
-                    token_logits = logits[i]
-                    next_token = PromptSampler.sample_token(token_logits)
-                else:
-                    next_token = self.tokenizer.eos_token_id
-
+                token_logits = logits[i]
+                next_token = PromptSampler.sample_token(token_logits)
                 seq.append_token(next_token)
-
+                # Update the KV cache if needed.
                 if self.use_kv_cache and new_past_list is not None:
                     seq.kv_cache = new_past_list[i]
 
             step_counter += 1
 
-        # Dump any final results.
+        # After exiting the loop, if any active sequences remain, trim them and store their result.
         for seq in self.active_seqs:
-            gen_text = self.tokenizer.decode(seq.get_final_generation(), skip_special_tokens=True)
+            trimmed_tokens = seq.get_final_generation()  # This should trim tokens after EOS if any.
+            gen_text = self.tokenizer.decode(trimmed_tokens, skip_special_tokens=True)
             if seq.prompt_text not in self.results:
                 self.results[seq.prompt_text] = []
             self.results[seq.prompt_text].append(gen_text)
-
-        self.save_results("generation_results.json")
-
+    
     def _run_generation_static(self):
         while self.active_seqs or self.prompt_deque:
             self._refill_active_seqs()
