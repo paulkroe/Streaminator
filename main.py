@@ -16,8 +16,8 @@ def main():
     model.eval()
 
     # Set up the stream manager.
-    stream_width = 2  # Adjust based on your GPU memory and throughput targets.
-    max_length = 250   # Maximum tokens to generate per completion.
+    stream_width = 6  # Adjust based on your GPU memory and throughput targets.
+    max_length = 300   # Maximum tokens to generate per completion.
     stream_manager = StreamManager(model,
         tokenizer,
         stream_width=stream_width,

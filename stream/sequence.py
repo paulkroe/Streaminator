@@ -1,5 +1,4 @@
 # sequence.py
-
 class Sequence:
     def __init__(self, prompt_text, max_length, eos_token_id):
         self.prompt_text = prompt_text
@@ -10,11 +9,11 @@ class Sequence:
         self.kv_cache = []
         self.generated_tokens = []
         
-        # If finished_pos is not None, it means we saw EOS at that index in generated_tokens
+        # When finished_pos is not None, it means we saw EOS in the generated_tokens.
         self.finished_pos = None
         
         # length_mask mirrors (prompt_tokens + generated_tokens). 
-        # For each token, 1 if valid/unfinished, 0 if padded or after eos.
+        # For each token, 1 if it is valid (part of the result), 0 if it is dummy/padding.
         self.length_mask = []
 
     def is_finished(self):
@@ -22,50 +21,45 @@ class Sequence:
 
     def next_input_token(self):
         """
-        For the next forward pass, we feed exactly the last token we generated
+        Return the last token generated (to feed into the next forward pass).
         """
         if len(self.generated_tokens) == 0:
-            # e.g. if we just created the seq but haven't appended anything
             return None
-        # Return the *last* token, ignoring whether it's finished or not.
         return self.generated_tokens[-1]
     
     def current_total_length(self):
         """
-        Returns how many tokens are in (prompt_tokens + generated_tokens).
+        Returns the total length = prompt tokens + generated tokens.
         """
         return len(self.prompt_tokens) + len(self.generated_tokens)
     
     def get_valid_length(self):
         """
-        The count of tokens up to (and including) the last real token.
-        That is just sum of self.length_mask.
+        Returns the count of valid tokens (including prompt tokens and generated tokens with mask==1).
         """
         return sum(self.length_mask)
 
     def get_final_generation(self):
         """
-        Decode the generation up to EOS (if present) or up to the final token.
+        Returns the generated tokens that are valid (i.e. tokens with mask 1, ignoring dummy tokens).
         """
-        if self.finished_pos is not None:
-            # decode only up to the eos token
-            valid_gens = self.generated_tokens[: self.finished_pos + 1]
-        else:
-            valid_gens = self.generated_tokens
-        return valid_gens
+        # Valid generated tokens = total valid tokens minus prompt tokens.
+        valid_generated = self.generated_tokens[: (self.get_valid_length() - len(self.prompt_tokens))]
+        return valid_generated
 
     def set_prompt_tokens(self, tokens):
         """
-        We call this right after we have the prompt tokens from tokenizer.
-        We fill 'length_mask' for them so they count as valid steps.
+        Set the prompt tokens and mark them as valid in the length mask.
         """
         self.prompt_tokens = tokens
-        # Mark the prompt tokens as valid in the length_mask
         self.length_mask = [1] * len(tokens)  
 
     def append_token(self, token_id):
+        """
+        Append a token. If the sequence is finished, mark the token as dummy (mask 0).
+        Otherwise, mark it as valid (mask 1). If an EOS is appended, set finished_pos.
+        """
         if self.is_finished():
-            # If the sequence is already finished, keep appending 0 so shapes stay consistent
             self.generated_tokens.append(token_id)
             self.length_mask.append(0)
             return
