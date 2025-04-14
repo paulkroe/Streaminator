@@ -18,14 +18,17 @@ def main():
     # Set up the stream manager.
     stream_width = 6  # Adjust based on your GPU memory and throughput targets.
     max_length = 300   # Maximum tokens to generate per completion.
+    use_kv_cache = True  # Use KV cache for faster generation.
+    continuous_batching = False  # Set to True for continuous batching.
     stream_manager = StreamManager(model,
         tokenizer,
         stream_width=stream_width,
         max_length=max_length,
-        use_kv_cache=True,
-        continuous_batching=True
+        use_kv_cache=use_kv_cache,
+        continuous_batching=continuous_batching
     )
-
+    print(f"Stream manager initialized with stream width {stream_width} and max length {max_length}.")
+    print(f"continuous_batching: {continuous_batching}, use_kv_cache: {use_kv_cache}")
 
     # template_text = textwrap.dedent("""
     #     System:
