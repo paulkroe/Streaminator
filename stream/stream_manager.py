@@ -107,17 +107,20 @@ class StreamManager:
         return [seq]
 
     def _refill_active_seqs(self):
+        # Define effective valid length: add +1 if sequence is finished.
+        effective_length = lambda seq: seq.get_valid_length() + (1 if seq.is_finished() else 0)
+
         # Step 1: Determine how many new sequences are needed.
         num_active = len(self.active_seqs)
         num_new_needed = self.stream_width - num_active
 
-        # Step 2: Trim each active sequence's KV cache to its valid tokens.
+        # Step 2: Trim each active sequence's KV cache to its effective valid tokens.
         for seq in self.active_seqs:
-            valid_length = seq.get_valid_length()
+            eff_len = effective_length(seq)
             trimmed_kv = []
             for (k, v) in seq.kv_cache:
-                trimmed_k = k[..., -valid_length:, :]
-                trimmed_v = v[..., -valid_length:, :]
+                trimmed_k = k[..., -eff_len:, :]
+                trimmed_v = v[..., -eff_len:, :]
                 trimmed_kv.append((trimmed_k, trimmed_v))
             seq.kv_cache = trimmed_kv
 
@@ -132,16 +135,16 @@ class StreamManager:
             if count > 1:
                 self.prompt_deque.append((prompt_text, count - 1))
         
-        # Step 4: Compute the maximum valid length among active sequences.
+        # Step 4: Compute the maximum effective valid length among active sequences.
         if self.active_seqs:
-            max_valid_length = max(seq.get_valid_length() for seq in self.active_seqs)
+            max_eff_len = max(effective_length(seq) for seq in self.active_seqs)
         else:
-            max_valid_length = 0
+            max_eff_len = 0
 
-        # Step 5: Left-pad KV caches to match the maximum valid length.
+        # Step 5: Left-pad KV caches so that every sequence has the same time dimension.
         for seq in self.active_seqs:
-            current_valid_length = seq.get_valid_length()
-            pad_size = max_valid_length - current_valid_length
+            cur_eff_len = effective_length(seq)
+            pad_size = max_eff_len - cur_eff_len
             if pad_size > 0:
                 padded_kv = []
                 for (k, v) in seq.kv_cache:
@@ -173,30 +176,45 @@ class StreamManager:
         return tuple(batched)
 
     def _build_leftpad_attention_mask(self):
+        """
+        Build an attention mask based on the left-padded KV cache time dimension.
+        We assume that all active sequences have been padded so that their KV caches
+        have the same time dimension T. We then create a mask with shape [B, T+1],
+        where the last column corresponds to the new token to be generated.
+        
+        For each sequence, we mark as valid (1) the positions corresponding to real tokens.
+        Since the KV cache was left-padded, each sequence's valid tokens appear in the
+        rightmost positions. We compute:
+        
+            valid = seq.get_valid_length()  # (from prompt plus generated tokens)
+            left_padding = T - valid
+            Then, for that sequence, valid positions are indices [left_padding, T),
+            and we additionally mark the extra column (index T) as valid.
+        """
         if not self.active_seqs:
             return None
 
-        # For each sequence, if it is finished, treat its valid length as one more.
-        adjusted_valid_lengths = [
-            seq.get_valid_length() + (1 if seq.is_finished() else 0)
-            for seq in self.active_seqs
-        ]
-        max_seq_len = max(adjusted_valid_lengths)
-        attention_mask = torch.zeros(len(self.active_seqs), max_seq_len, dtype=torch.long, device=self.device)
-
-        # Fill the valid positions per sequence.
+        # All active sequences have been left-padded to the same time dimension T.
+        T = self.active_seqs[0].kv_cache[0][0].shape[2]  # time dimension of keys in KV cache
+        B = len(self.active_seqs)
+        mask = torch.zeros(B, T + 1, dtype=torch.long, device=self.device)
         for i, seq in enumerate(self.active_seqs):
-            valid_len = seq.get_valid_length()
-            if seq.is_finished():
-                valid_len += 1  # Include an extra token for finished sequences.
-            start = max_seq_len - valid_len
-            attention_mask[i, start:] = 1
-        return attention_mask
+            valid = seq.get_valid_length()  # count of valid tokens (prompt+generated)
+            # In left-padded KV caches, the last 'valid' columns are valid.
+            # Compute the starting index of valid tokens.
+            start = T - valid
+            # Set the columns for valid tokens and also the extra new token column to 1.
+            mask[i, start:] = 1
+        # For debugging, you can print the mask shape:
+        # print("Attention mask shape:", mask.shape)
+        return mask
+
 
     def _generate_step_with_kv(self):
         if not self.active_seqs:
             return None, None
 
+        effective_length = lambda seq: seq.get_valid_length() + (1 if seq.is_finished() else 0)
         input_tokens = []
         positions = []
         num_idle_seqs = 0
@@ -205,14 +223,13 @@ class StreamManager:
             # Every sequence should have been prefilled; last_tok should not be None.
             if last_tok is None:
                 raise ValueError("Sequence has no generated token; it should have been prefilled with a first token.")
-            # For sequences that have finished generation, supply the EOS token as a dummy input.
+            # For sequences that have finished generation, supply the EOS token as input.
             if seq.is_finished():
-                # print(f"Sequence {seq.prompt_text} is finished.")
                 last_tok = self.tokenizer.eos_token_id
                 num_idle_seqs += 1
             input_tokens.append(last_tok)
-            # Use the valid token count (prompt + non-dummy generated tokens) for position IDs.
-            positions.append(seq.get_valid_length())
+            # Use the effective valid length (i.e. add one for finished sequences).
+            positions.append(effective_length(seq))
         
         if num_idle_seqs == len(self.active_seqs):
             return None, None
@@ -260,8 +277,6 @@ class StreamManager:
 
         sequences_inputs = []
         for seq in self.active_seqs:
-            # Here we use the entire sequence (prompt + generated tokens);
-            # note that dummy tokens (with mask 0) will be present.
             gen_tensor = torch.tensor(seq.generated_tokens, device=self.device)
             full_input = torch.cat([seq.prompt_tokens, gen_tensor])
             sequences_inputs.append(full_input)
@@ -299,10 +314,10 @@ class StreamManager:
 
         # Continue until no active sequences or prompts remain.
         while self.active_seqs or self.prompt_deque:
-            if step_counter % self.refill_period == 0:               
+            if step_counter % self.refill_period == 0:
                 still_active = []
                 for seq in self.active_seqs:
-                    # If the sequence has generated an EOS or is finished, process its valid tokens.
+                    # If the sequence has generated an EOS (or is finished), process its valid output.
                     if self.tokenizer.eos_token_id in seq.generated_tokens or seq.is_finished():
                         trimmed_tokens = seq.get_final_generation()
                         gen_text = self.tokenizer.decode(trimmed_tokens, skip_special_tokens=True)
@@ -342,7 +357,7 @@ class StreamManager:
             if seq.prompt_text not in self.results:
                 self.results[seq.prompt_text] = []
             self.results[seq.prompt_text].append(gen_text)
-    
+
     def _run_generation_static(self):
         while self.active_seqs or self.prompt_deque:
             self._refill_active_seqs()
@@ -375,7 +390,6 @@ class StreamManager:
                     )
                     if self.use_kv_cache and new_past_list is not None:
                         seq.kv_cache = new_past_list[i]
-
                     if seq.is_finished():
                         finished_indices.append(i)
 

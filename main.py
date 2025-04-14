@@ -23,7 +23,7 @@ def main():
         stream_width=stream_width,
         max_length=max_length,
         use_kv_cache=True,
-        continuous_batching=False
+        continuous_batching=True
     )
 
 
