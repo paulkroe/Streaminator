@@ -40,7 +40,11 @@ class StreamManager:
 
         self.prompt_deque = deque()
         self.active_seqs = []
+        # This dictionary will store results keyed by prompt text.
+        # (In Python 3.7+ dicts are insertion ordered.)
         self.results = {}
+        # Keep a separate list to record the order in which prompts were enqueued.
+        self.prompt_order = []
         self.device = next(model.parameters()).device
         
         # Cache prompt KV caches for re-use if available.
@@ -53,42 +57,38 @@ class StreamManager:
 
     def enqueue_prompt(self, prompt_text, num_completions=1):
         self._debug_print(f"Enqueue prompt: {prompt_text[:60]!r}, num_completions={num_completions}")
+        # Record the order as a separate list.
+        self.prompt_order.append(prompt_text)
         self.prompt_deque.append((prompt_text, num_completions))
 
     def _prefill_prompt(self, prompt_text, num_completions):
+        # (Same as before)
         self._debug_print(f"Prefilling prompt: {prompt_text[:60]!r}")
         inputs = self.tokenizer(prompt_text, return_tensors='pt')
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
-        # Shape: [prompt_len]
         prompt_tokens = inputs["input_ids"][0]
 
-        # Forward pass on the entire prompt.
         with torch.no_grad():
             outputs = self.model(**inputs, use_cache=self.use_kv_cache)
 
-        # Create a Sequence.
         seq = Sequence(
             prompt_text=prompt_text,
             max_length=self.max_length,
             eos_token_id=self.tokenizer.eos_token_id,
         )
-        # Store the prompt tokens and fill the length_mask.
         seq.set_prompt_tokens(prompt_tokens.clone())
 
         if self.use_kv_cache:
-            # Check if the KV cache for this prompt has already been computed.
             if prompt_text in self.prompt_kv_cache:
                 seq.kv_cache = self.prompt_kv_cache[prompt_text]
             else:
                 seq.kv_cache = KVCacheManager.clone(outputs.past_key_values)
                 self.prompt_kv_cache[prompt_text] = seq.kv_cache
 
-        # Sample one token from the final logits.
         prefix_logits = outputs.logits[0, -1, :]
         token_id = PromptSampler.sample_token(prefix_logits)
 
-        # Do a second forward pass with the single token so the KV cache includes it.
         single_tok = torch.tensor([[token_id]], device=self.device)
         if self.use_kv_cache:
             with torch.no_grad():
@@ -97,13 +97,9 @@ class StreamManager:
                     past_key_values=KVCacheWrapper.wrap(seq.kv_cache, self.model),
                     use_cache=True
                 )
-            # Update KV cache to include the first generated token.
             seq.kv_cache = KVCacheManager.clone(out2.past_key_values)
 
-        # Append that token to the Sequence.
         seq.append_token(token_id)
-
-        # Return a list of sequences (for num_completions > 1, you could duplicate here if needed).
         return [seq]
 
     def _refill_active_seqs(self):
@@ -405,6 +401,12 @@ class StreamManager:
                 step_counter += 1
 
     def save_results(self, filename):
+        # Create an ordered dictionary based on the prompt order.
+        ordered_results = {}
+        # Use the recorded prompt order to output results.
+        for prompt in self.prompt_order:
+            # In case there was no result generated for a prompt, default to an empty list.
+            ordered_results[prompt] = self.results.get(prompt, [])
         with open(filename, "w") as f:
-            json.dump(self.results, f, indent=2)
+            json.dump(ordered_results, f, indent=2)
         print(f"Results saved to {filename}")
