@@ -6,16 +6,18 @@ import json
 import random
 import torch
 import textwrap
+import wandb
 from string import Template
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from stream import StreamManager
 from tests import GSM8KAnswerChecker
 from data import load_random_gsm8k
+import pynvml
 
 def main():
     # 1) Load a random sample of GSM8K examples from Hugging Face.
-    num_samples = 25
+    num_samples = 10
     examples = load_random_gsm8k(num_samples=num_samples, seed=42)
 
     # 2) Load model and tokenizer.
@@ -33,14 +35,30 @@ def main():
     continuous_batching = True
     num_completions = 8
 
+    wandb.init(
+        project="pipeline-profiling",
+        entity="multi-answer-spec-decoding",
+        config={
+            "model_name": model_name,
+            "num_samples": num_samples,
+            "stream_width": stream_width,
+            "max_length": max_length,
+            "num_completions": num_completions,
+            "use_kv_cache": use_kv_cache,
+            "continuous_batching": continuous_batching,
+        }
+    )
+
     stream_manager = StreamManager(
         model,
         tokenizer,
         stream_width=stream_width,
         max_length=max_length,
         use_kv_cache=use_kv_cache,
-        continuous_batching=continuous_batching
+        continuous_batching=continuous_batching,
+        logger=wandb
     )
+
     print(f"Stream manager initialized: stream_width={stream_width}, max_length={max_length}")
     print(f"continuous_batching={continuous_batching}, use_kv_cache={use_kv_cache}")
 
@@ -97,6 +115,8 @@ def main():
     stream_manager.run_generation_loop()
     end = time.time()
     print(f"Generation took {end - start:.2f} seconds.")
+    wandb.log({"total_generation_time_sec": end - start})
+
 
     # 8) Convert StreamManager results into a structure for answer-checking.
     #    Each prompt in prompt_map => { "generations": [...], "ground_truth": ... }
@@ -131,6 +151,20 @@ def main():
 
     overall_pass_rate = correct_questions / num_questions if num_questions > 0 else 0.0
     print(f"\nOverall pass@n rate = {overall_pass_rate:.3f} (i.e., fraction of prompts with at least one correct)")
+    wandb.log({"overall_pass@n_rate": overall_pass_rate})
+
+    # Compute average length of all generated completions
+    all_completion_lengths = [
+        len(tokenizer.encode(g, add_special_tokens=False))
+        for completions in stream_manager.results.values()
+        for g in completions
+    ]
+    avg_completion_length = sum(all_completion_lengths) / len(all_completion_lengths) if all_completion_lengths else 0.0
+    print(f"Average completion length (in tokens): {avg_completion_length:.2f}")
+    wandb.log({"avg_completion_length_tokens": avg_completion_length})
+
+
 
 if __name__ == "__main__":
     main()
+    pynvml.nvmlShutdown()

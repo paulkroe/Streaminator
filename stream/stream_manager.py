@@ -7,6 +7,8 @@ from .prompt_sampler import PromptSampler
 from .kv_cache_manager import KVCacheManager
 from .kv_cache_wrapper import KVCacheWrapper
 from .sequence import Sequence
+import pynvml
+pynvml.nvmlInit()
 
 class StreamManager:
     def __init__(
@@ -18,8 +20,8 @@ class StreamManager:
         refill_period=5,
         use_kv_cache=True,
         continuous_batching=True,
-        wandb_logging=False,
-        debug=False,
+        logger=None,
+        debug=False
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -28,15 +30,10 @@ class StreamManager:
         self.refill_period = refill_period
         self.use_kv_cache = use_kv_cache
         self.continuous_batching = continuous_batching
-        self.wandb_logging = wandb_logging
         self.debug = debug
+        self.logger = logger
 
-        if self.wandb_logging:
-            try:
-                import wandb
-                self.wandb = wandb
-            except ImportError:
-                raise ImportError("wandb_logging is enabled, but wandb is not installed.")
+        self.gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)  # Profiling GPU 0
 
         self.prompt_deque = deque()
         self.active_seqs = []
@@ -50,6 +47,22 @@ class StreamManager:
         # Cache prompt KV caches for re-use if available.
         if self.use_kv_cache:
             self.prompt_kv_cache = {}
+
+    def _log_gpu_stats(self, step):
+        if not self.logger:
+            return
+        try:
+            util = pynvml.nvmlDeviceGetUtilizationRates(self.gpu_handle)
+            mem_info = pynvml.nvmlDeviceGetMemoryInfo(self.gpu_handle)
+            self.logger.log({
+                "gpu utilization": util.gpu,
+                "gpu memory (MB)": mem_info.used / 1024**2,
+                "gpu memory usage (%)": mem_info.used / mem_info.total * 100,
+                "generation step": step,
+            })
+        except pynvml.NVMLError as e:
+            self._debug_print(f"Failed to log GPU stats: {e}")
+
 
     def _debug_print(self, msg):
         if self.debug:
@@ -324,6 +337,7 @@ class StreamManager:
                         still_active.append(seq)
                 self.active_seqs = still_active
                 self._refill_active_seqs()
+
             if not self.active_seqs:
                 step_counter += 1
                 continue
@@ -346,6 +360,9 @@ class StreamManager:
 
             step_counter += 1
 
+            if step_counter % 5 == 0:
+                self._log_gpu_stats(step_counter)
+
         # Finalize any remaining active sequences.
         for seq in self.active_seqs:
             trimmed_tokens = seq.get_final_generation()
@@ -362,10 +379,6 @@ class StreamManager:
 
             step_counter = 0
             while self.active_seqs:
-                if self.wandb_logging:
-                    frac = len(self.active_seqs) / self.stream_width
-                    self.wandb.log({"non_padding_fraction": frac})
-
                 if self.use_kv_cache:
                     logits, new_past_list = self._generate_step_with_kv()
                 else:
@@ -399,6 +412,10 @@ class StreamManager:
                     del self.active_seqs[idx]
 
                 step_counter += 1
+
+                if step_counter % 5 == 0:
+                    self._log_gpu_stats(step_counter)
+
 
     def save_results(self, filename):
         # Create an ordered dictionary based on the prompt order.
