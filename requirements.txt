@@ -1,1 +1,1 @@
-pip install pynvml
+pynvml

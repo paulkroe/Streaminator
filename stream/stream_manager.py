@@ -54,14 +54,19 @@ class StreamManager:
         try:
             util = pynvml.nvmlDeviceGetUtilizationRates(self.gpu_handle)
             mem_info = pynvml.nvmlDeviceGetMemoryInfo(self.gpu_handle)
-            self.logger.log({
-                "gpu utilization": util.gpu,
+        except pynvml.NVMLError as e:
+            self._debug_print(f"Failed to log GPU stats: {e}")
+
+        stream_utilization = sum([0 if seq.is_finished() else 1 for seq in self.active_seqs])/self.stream_width * 100
+
+        self.logger.log({
+                "gpu SM utilization (%)": util.gpu,
                 "gpu memory (MB)": mem_info.used / 1024**2,
                 "gpu memory usage (%)": mem_info.used / mem_info.total * 100,
                 "generation step": step,
-            })
-        except pynvml.NVMLError as e:
-            self._debug_print(f"Failed to log GPU stats: {e}")
+                "steam utilization (%)": stream_utilization,
+        })
+
 
 
     def _debug_print(self, msg):
@@ -360,8 +365,7 @@ class StreamManager:
 
             step_counter += 1
 
-            if step_counter % 5 == 0:
-                self._log_gpu_stats(step_counter)
+            self._log_gpu_stats(step_counter)
 
         # Finalize any remaining active sequences.
         for seq in self.active_seqs:
@@ -413,8 +417,7 @@ class StreamManager:
 
                 step_counter += 1
 
-                if step_counter % 5 == 0:
-                    self._log_gpu_stats(step_counter)
+                self._log_gpu_stats(step_counter)
 
 
     def save_results(self, filename):
