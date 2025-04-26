@@ -35,6 +35,11 @@ def main():
     use_kv_cache = True
     continuous_batching = True
     num_completions = 2
+    
+    # N-gram speculative decoding parameters
+    use_ngram_specdec = True
+    ngram_n = 3
+    speculative_k = 5
 
     wandb.init(
         project="pipeline-profiling",
@@ -47,6 +52,9 @@ def main():
             "num_completions": num_completions,
             "use_kv_cache": use_kv_cache,
             "continuous_batching": continuous_batching,
+            "use_ngram_specdec": use_ngram_specdec,
+            "ngram_n": ngram_n,
+            "speculative_k": speculative_k,
         }
     )
 
@@ -57,11 +65,15 @@ def main():
         max_length=max_length,
         use_kv_cache=use_kv_cache,
         continuous_batching=continuous_batching,
+        use_ngram_specdec=use_ngram_specdec,
+        ngram_n=ngram_n,
+        speculative_k=speculative_k,
         logger=wandb
     )
 
     print(f"Stream manager initialized: stream_width={stream_width}, max_length={max_length}")
     print(f"continuous_batching={continuous_batching}, use_kv_cache={use_kv_cache}")
+    print(f"N-gram speculative decoding: enabled={use_ngram_specdec}, n={ngram_n}, k={speculative_k}")
 
     # 4) Define your prompt template.
     template_text = textwrap.dedent("""
@@ -188,6 +200,24 @@ def main():
     )
     print(f"Average completion length (in tokens): {avg_completion_length:.2f}")
     wandb.log({"avg_completion_length_tokens": avg_completion_length})
+
+    # Log n-gram speculative decoding statistics
+    if use_ngram_specdec:
+        # Calculate average n-gram model size per prompt
+        ngram_model_sizes = []
+        for prompt_text, ngram_model in stream_manager.prompt_ngram_models.items():
+            # Count total entries in the n-gram counts dictionary
+            total_entries = sum(len(contexts) for contexts in ngram_model.counts.values())
+            ngram_model_sizes.append(total_entries)
+        
+        avg_ngram_model_size = sum(ngram_model_sizes) / len(ngram_model_sizes) if ngram_model_sizes else 0
+        print(f"Average n-gram model entries per prompt: {avg_ngram_model_size:.2f}")
+        
+        wandb.log({
+            "avg_ngram_model_size": avg_ngram_model_size,
+            "ngram_n": ngram_n,
+            "speculative_k": speculative_k
+        })
 
     with open("evaluation_results.json", "w") as f:
         json.dump(results_for_eval, f, indent=2)
