@@ -20,9 +20,6 @@ class StreamManager:
         refill_period=5,
         use_kv_cache=True,
         continuous_batching=True,
-        use_ngram_specdec=False,
-        ngram_n=3,
-        speculative_k=5,
         logger=None,
         debug=False
     ):
@@ -35,12 +32,6 @@ class StreamManager:
         self.continuous_batching = continuous_batching
         self.debug = debug
         self.logger = logger
-        
-        # N-gram speculative decoding parameters
-        self.use_ngram_specdec = use_ngram_specdec
-        self.ngram_n = ngram_n
-        self.speculative_k = speculative_k
-        self.prompt_ngram_models = {}
 
         self.gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)  # Profiling GPU 0
 
@@ -91,7 +82,6 @@ class StreamManager:
     def _prefill_prompt(self, prompt_text, num_completions):
         # (Same as before)
         self._debug_print(f"Prefilling prompt: {prompt_text[:60]!r}")
-
         inputs = self.tokenizer(prompt_text, return_tensors='pt')
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
@@ -106,17 +96,6 @@ class StreamManager:
             eos_token_id=self.tokenizer.eos_token_id,
         )
         seq.set_prompt_tokens(prompt_tokens.clone())
-
-        # Initialize n-gram model if using speculative decoding
-        if self.use_ngram_specdec:
-            if prompt_text not in self.prompt_ngram_models:
-                from .ngram_model import NGramModel
-                self.prompt_ngram_models[prompt_text] = NGramModel(self.ngram_n)
-            
-            seq.ngram_model = self.prompt_ngram_models[prompt_text]
-            seq.ngram_n = self.ngram_n
-            seq.last_accepted_token_ids = prompt_tokens.tolist()
-            seq.ngram_model.update(seq.last_accepted_token_ids)
 
         if self.use_kv_cache:
             if prompt_text in self.prompt_kv_cache:
@@ -335,212 +314,6 @@ class StreamManager:
         logits_tensor = torch.stack(logits_list, dim=0)
         return logits_tensor, None
 
-    def _speculative_generate_step(self):
-        """Perform a generation step with n-gram speculative decoding."""
-        if not self.active_seqs:
-            return None, None
-        
-        # If not using n-gram speculative decoding, fall back to normal generation
-        if not self.use_ngram_specdec:
-            if self.use_kv_cache:
-                return self._generate_step_with_kv()
-            else:
-                return self._generate_step_without_kv()
-        
-        # Drafting phase
-        drafts = [[] for _ in self.active_seqs]
-        
-        for i, seq in enumerate(self.active_seqs):
-            if seq.is_finished() or seq.ngram_model is None:
-                continue
-            
-            # Get context for this sequence
-            context = seq.last_accepted_token_ids[-(seq.ngram_n - 1):]
-            
-            # Generate draft tokens
-            for _ in range(self.speculative_k):
-                next_token = seq.ngram_model.sample(context)
-                if next_token is None or next_token == self.tokenizer.eos_token_id:
-                    break
-                    
-                drafts[i].append(next_token)
-                # Update context for the next draft step
-                context = (context + [next_token])[-(seq.ngram_n - 1):]
-        
-        # Verification phase prep
-        max_draft_len = max(len(d) for d in drafts) if drafts else 0
-        
-        # If no drafts were generated, do regular generation
-        if max_draft_len == 0:
-            if self.use_kv_cache:
-                return self._generate_step_with_kv()
-            else:
-                return self._generate_step_without_kv()
-        
-        # Prepare inputs for verification
-        batch_size = len(self.active_seqs)
-        input_ids = torch.full((batch_size, 1 + max_draft_len), 
-                             self.tokenizer.pad_token_id if hasattr(self.tokenizer, 'pad_token_id') else self.tokenizer.eos_token_id, 
-                             dtype=torch.long, 
-                             device=self.device)
-        
-        # Position IDs
-        positions = []
-        for seq in self.active_seqs:
-            start_pos = seq.get_valid_length() + (1 if seq.is_finished() else 0)
-            pos_seq = list(range(start_pos, start_pos + 1 + max_draft_len))
-            positions.append(pos_seq)
-        position_ids = torch.tensor(positions, dtype=torch.long, device=self.device)
-        
-        # Fill input IDs
-        for i, seq in enumerate(self.active_seqs):
-            last_tok = seq.next_input_token()
-            if last_tok is None:  # Should not happen if sequence was prefilled
-                last_tok = self.tokenizer.eos_token_id
-            if seq.is_finished():
-                last_tok = self.tokenizer.eos_token_id
-            
-            # Put last token + draft tokens
-            input_ids[i, 0] = last_tok
-            for j, token in enumerate(drafts[i]):
-                input_ids[i, j+1] = token
-        
-        # Get KV cache
-        batched_kv = self._get_batched_kv()
-        if batched_kv is None:
-            return None, None
-        
-        past_for_model = KVCacheWrapper.wrap(batched_kv, self.model)
-        
-        # Create attention mask
-        base_attention_mask = self._build_leftpad_attention_mask()
-        if base_attention_mask is None:
-            return None, None
-        
-        # Extend mask for draft tokens: [B, T+1] -> [B, T+1+max_draft_len]
-        draft_mask = torch.ones(base_attention_mask.size(0), 1 + max_draft_len, 
-                               dtype=base_attention_mask.dtype, 
-                               device=base_attention_mask.device)
-        # For each sequence, mask out padding in its draft
-        for i, d in enumerate(drafts):
-            if len(d) < max_draft_len:
-                draft_mask[i, len(d)+1:] = 0
-        
-        attention_mask = torch.cat([base_attention_mask, draft_mask], dim=1)
-        
-        # Run the model for verification
-        with torch.no_grad():
-            outputs = self.model(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                past_key_values=past_for_model,
-                use_cache=True,
-                attention_mask=attention_mask,
-            )
-        
-        logits_full = outputs.logits  # Shape: [B, 1+max_draft_len, vocab_size]
-        new_past_full = outputs.past_key_values
-        
-        # Handle each sequence
-        new_past_list = []
-        
-        # Collect verification stats for logging
-        accepted_counts = []
-        
-        for i, seq in enumerate(self.active_seqs):
-            if seq.is_finished():
-                # Add placeholder for finished sequences
-                new_past_list.append(seq.kv_cache)
-                continue
-            
-            # Get this sequence's logits and draft
-            seq_logits = logits_full[i]  # Shape: [1+max_draft_len, vocab_size]
-            seq_draft = drafts[i]
-            
-            # Check how many draft tokens we accept
-            num_accepted = 0
-            for j in range(len(seq_draft)):
-                # Use argmax for verification (deterministic check)
-                llm_token = torch.argmax(seq_logits[j], dim=-1).item()
-                if llm_token == seq_draft[j]:
-                    num_accepted += 1
-                else:
-                    break
-            
-            # Collect stats
-            accepted_counts.append(num_accepted)
-            
-            # Add accepted tokens to sequence
-            for j in range(num_accepted):
-                seq.generated_tokens.append(seq_draft[j])
-                seq.last_accepted_token_ids.append(seq_draft[j])
-                seq.length_mask.append(1)  # Mark as valid tokens
-                
-                # Check if we need to mark the sequence as finished
-                if seq_draft[j] == self.tokenizer.eos_token_id:
-                    seq.finished_pos = len(seq.generated_tokens) - 1
-            
-            # Update ngram model with accepted tokens
-            if num_accepted > 0 and seq.ngram_model is not None:
-                seq.ngram_model.update(seq.last_accepted_token_ids)
-            
-            # If we didn't accept all drafts or reached the end of drafts,
-            # sample one more token from the LLM (unless sequence is finished)
-            additional_token = None
-            if (num_accepted < len(seq_draft) or len(seq_draft) < self.speculative_k) and not seq.is_finished():
-                token_logits = seq_logits[num_accepted]
-                additional_token = PromptSampler.sample_token(token_logits)
-                seq.generated_tokens.append(additional_token)
-                seq.last_accepted_token_ids.append(additional_token)
-                seq.length_mask.append(1)  # Mark as valid
-                
-                # Check if the additional token is EOS
-                if additional_token == self.tokenizer.eos_token_id:
-                    seq.finished_pos = len(seq.generated_tokens) - 1
-                
-                # Update ngram model
-                if seq.ngram_model is not None:
-                    seq.ngram_model.update(seq.last_accepted_token_ids)
-                    
-                num_accepted += 1  # Count the additional token
-            
-            # Extract KV cache for this sequence
-            # This is tricky - need to get the right slice of the time dimension
-            seq_past = []
-            for layer_i in range(len(new_past_full)):
-                k_layer = new_past_full[layer_i][0][i].unsqueeze(0)
-                v_layer = new_past_full[layer_i][1][i].unsqueeze(0)
-                
-                # If we accepted any tokens (including the additional one),
-                # slice to the appropriate length
-                if num_accepted > 0:
-                    # Keep only the first num_accepted entries from the generated part
-                    k_layer = k_layer[..., -num_accepted:, :]
-                    v_layer = v_layer[..., -num_accepted:, :]
-                    
-                seq_past.append((k_layer, v_layer))
-                
-            new_past_list.append(seq_past)
-        
-        # Log statistics if logger is available
-        if self.logger and accepted_counts:
-            avg_accepted = sum(accepted_counts) / len(accepted_counts)
-            self.logger.log({
-                "avg_accepted_tokens": avg_accepted,
-                "speedup_factor": 1 + avg_accepted  # 1 + avg tokens accepted per step
-            })
-        
-        # For the first token, we need the logits for potential sampling
-        # Extract the logits for the position after the accepted tokens
-        result_logits = torch.stack([
-            outputs.logits[i, min(len(drafts[i]), max_draft_len-1)] 
-            if i < len(self.active_seqs) and not self.active_seqs[i].is_finished() 
-            else outputs.logits[i, 0]  # Fallback for finished sequences
-            for i in range(len(self.active_seqs))
-        ])
-        
-        return result_logits, new_past_list
-
     def run_generation_loop(self):
         if self.continuous_batching:
             self._run_generation_continuous()
@@ -574,18 +347,16 @@ class StreamManager:
                 step_counter += 1
                 continue
 
-            # Use speculative generation step instead of direct KV cache generation
-            logits, new_past_list = self._speculative_generate_step()
+            if self.use_kv_cache:
+                logits, new_past_list = self._generate_step_with_kv()
+            else:
+                logits, new_past_list = self._generate_step_without_kv()
 
             if logits is None:
                 step_counter += 1
                 continue
 
             for i, seq in enumerate(self.active_seqs):
-                # Skip if sequence already processed tokens in speculative step
-                if self.use_ngram_specdec:
-                    continue
-                    
                 token_logits = logits[i]
                 next_token = PromptSampler.sample_token(token_logits)
                 seq.append_token(next_token)
@@ -612,8 +383,10 @@ class StreamManager:
 
             step_counter = 0
             while self.active_seqs:
-                # Use speculative generation step instead of direct KV cache generation
-                logits, new_past_list = self._speculative_generate_step()
+                if self.use_kv_cache:
+                    logits, new_past_list = self._generate_step_with_kv()
+                else:
+                    logits, new_past_list = self._generate_step_without_kv()
 
                 if logits is None:
                     step_counter += 1
@@ -621,13 +394,6 @@ class StreamManager:
 
                 finished_indices = []
                 for i, seq in enumerate(self.active_seqs):
-                    # Skip if sequence already processed tokens in speculative step
-                    if self.use_ngram_specdec:
-                        # Only check if sequence is finished
-                        if seq.is_finished():
-                            finished_indices.append(i)
-                        continue
-                        
                     token_logits = logits[i]
                     next_token = PromptSampler.sample_token(token_logits)
                     seq.append_token(next_token)

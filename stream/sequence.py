@@ -15,11 +15,6 @@ class Sequence:
         # length_mask mirrors (prompt_tokens + generated_tokens). 
         # 1 indicates a valid token; 0 indicates a dummy/padding token.
         self.length_mask = []
-        
-        # For n-gram speculative decoding
-        self.ngram_model = None
-        self.ngram_n = 0
-        self.last_accepted_token_ids = []
 
     def is_finished(self):
         return self.finished_pos is not None or len(self.generated_tokens) >= self.max_length
@@ -71,13 +66,6 @@ class Sequence:
 
         self.generated_tokens.append(token_id)
         self.length_mask.append(1)
-        
-        # For n-gram speculative decoding: track accepted tokens
-        self.last_accepted_token_ids.append(token_id)
-        
-        # Update n-gram model if available
-        if self.ngram_model is not None:
-            self.ngram_model.update(self.last_accepted_token_ids)
 
         if token_id == self.eos_token_id:
             self.finished_pos = len(self.generated_tokens) - 1
