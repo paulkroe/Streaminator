@@ -10,6 +10,8 @@ from .kv_cache_manager import KVCacheManager
 from .kv_cache_wrapper import KVCacheWrapper
 from .sequence import Sequence
 import pynvml
+from tqdm import tqdm
+import gc
 pynvml.nvmlInit()
 
 class StreamManager:
@@ -25,7 +27,6 @@ class StreamManager:
         logger=None,
         debug=False
     ):
-        import gc
         self.model = model
         self.tokenizer = tokenizer
         self.stream_width = stream_width
@@ -50,11 +51,7 @@ class StreamManager:
         if self.logger:
             self.events = self.logger.Table(columns=["step", "prompt"])
 
-    def _log_memory(self, context):
-        if self.debug:
-            alloc = torch.cuda.memory_allocated(self.device) / 1e6
-            reserved = torch.cuda.memory_reserved(self.device) / 1e6
-            print(f"[MEM] {context}: allocated={alloc:.1f}MB reserved={reserved:.1f}MB")
+        self.len_queue = 0
 
     def _log_gpu_stats(self, step):
         if not self.logger:
@@ -78,38 +75,59 @@ class StreamManager:
             print(f"[DEBUG] {msg}")
 
     def enqueue_prompt(self, prompt_text, num_completions=1):
+        self.len_queue += num_completions
         self._debug_print(f"Enqueue prompt: {prompt_text[:60]!r}, num_completions={num_completions}")
         self.prompt_order.append(prompt_text)
         self.prompt_deque.append((prompt_text, num_completions))
 
     def _prefill_prompt(self, prompt_text, num_completions):
+        """
+        Prefill a single completion for `prompt_text`, sampling one token.
+        On-use of KV caching, initialize and update the cache; otherwise, skip cache calls.
+        """
         self._debug_print(f"Prefilling prompt: {prompt_text[:60]!r}")
-        self._log_memory("before prefill model call")
         inputs = self.tokenizer(prompt_text, return_tensors='pt').to(self.device)
         prompt_tokens = inputs.input_ids[0]
-        with torch.no_grad():
-            outputs = self.model(**inputs, use_cache=self.use_kv_cache)
-        self._log_memory("after prefill model call")
 
-        seq = Sequence(prompt_text, self.max_length, self.tokenizer.eos_token_id)
+        # First forward pass to get prefix logits (with or without caching)
+        with torch.no_grad():
+            outputs = self.model(
+                **inputs,
+                use_cache=self.use_kv_cache,
+            )
+
+        # Build sequence object
+        seq = Sequence(
+            prompt_text=prompt_text,
+            max_length=self.max_length,
+            eos_token_id=self.tokenizer.eos_token_id,
+        )
         seq.set_prompt_tokens(prompt_tokens.clone())
+
+        # Sample the first non-prompt token
+        prefix_logits = outputs.logits[0, -1]
+        first_token = PromptSampler.sample_token(prefix_logits)
         if self.use_kv_cache:
+            # Initialize KV cache from the first pass
             cache = KVCacheManager.clone(outputs.past_key_values)
             self.prompt_kv_cache.setdefault(prompt_text, cache)
             seq.kv_cache = cache
 
-        first_token = PromptSampler.sample_token(outputs.logits[0, -1])
-        single_tok = torch.tensor([[first_token]], device=self.device)
-        with torch.no_grad():
-            out2 = self.model(input_ids=single_tok,
-                              past_key_values=KVCacheWrapper.wrap(seq.kv_cache, self.model),
-                              use_cache=True)
-        seq.kv_cache = KVCacheManager.clone(out2.past_key_values)
+            # Run second pass to update cache with the newly sampled token
+            single_tok = torch.tensor([[first_token]], device=self.device)
+            with torch.no_grad():
+                out2 = self.model(
+                    input_ids=single_tok,
+                    past_key_values=KVCacheWrapper.wrap(seq.kv_cache, self.model),
+                    use_cache=True,
+                )
+            seq.kv_cache = KVCacheManager.clone(out2.past_key_values)
+
+        # Append the sampled token and return
         seq.append_token(first_token)
         return [seq]
 
     def _refill_active_seqs(self):
-        self._log_memory("refill start")
         eff_len = lambda s: s.get_valid_length() + (1 if s.is_finished() else 0)
         # trim old
         for seq in self.active_seqs:
@@ -136,10 +154,8 @@ class StreamManager:
                         F.pad(k, (0,0,pad,0)),
                         F.pad(v, (0,0,pad,0))
                     ) for k,v in seq.kv_cache]
-        self._log_memory("refill end")
 
     def _get_batched_kv(self):
-        self._log_memory("before batching KV")
         if not self.active_seqs:
             return None
         layers = len(self.active_seqs[0].kv_cache)
@@ -148,11 +164,9 @@ class StreamManager:
             ks = [s.kv_cache[i][0] for s in self.active_seqs]
             vs = [s.kv_cache[i][1] for s in self.active_seqs]
             batched.append((torch.cat(ks,0), torch.cat(vs,0)))
-        self._log_memory("after batching KV")
         return tuple(batched)
 
     def _build_leftpad_attention_mask(self):
-        self._log_memory("build mask start")
         if not self.active_seqs:
             return None
         T = self.active_seqs[0].kv_cache[0][0].shape[2]
@@ -161,11 +175,9 @@ class StreamManager:
         for i,seq in enumerate(self.active_seqs):
             v = seq.get_valid_length()
             mask[i, T-v:]=1
-        self._log_memory("build mask end")
         return mask.long()
 
     def _generate_step_with_kv(self):
-        self._log_memory("gen step start")
         if not self.active_seqs:
             return None, None
         toks, pos, idle = [], [], 0
@@ -196,7 +208,6 @@ class StreamManager:
             for layer in new_past:
                 seq_kv.append((layer[0][i:i+1], layer[1][i:i+1]))
             per.append(seq_kv)
-        self._log_memory("gen step end")
         return logits, per
 
     def _generate_step_without_kv(self):
@@ -228,6 +239,66 @@ class StreamManager:
         logits_tensor = torch.stack(logits_list, dim=0)
         return logits_tensor, None
 
+    def _run_generation_static(self):
+        """
+        Static generation loop refactored to mirror the continuous version's flow:
+         - Refill at regular intervals
+         - Generate one step per iteration
+         - Clean up finished sequences and free their KV caches
+         - Log GPU stats each generation step
+        """
+        # Initial refill
+        self._refill_active_seqs()
+        step_counter = 0
+
+        # Continue until all prompts are processed
+        while self.active_seqs or self.prompt_deque:
+            # Refill at period boundaries
+            if step_counter % self.refill_period == 0:
+                still_active = []
+                for seq in self.active_seqs:
+                    if seq.is_finished() or self.tokenizer.eos_token_id in seq.generated_tokens:
+                        # Collect final text
+                        text = self.tokenizer.decode(seq.get_final_generation(), skip_special_tokens=True)
+                        self.results.setdefault(seq.prompt_text, []).append(text)
+                        # Free KV cache and sequence
+                        seq.kv_cache = None
+                        del seq
+                        self.pbar.update(1)
+                    else:
+                        still_active.append(seq)
+                # Force GC and clear PyTorch cache to release GPU memory
+                gc.collect()
+                torch.cuda.empty_cache()
+
+                self.active_seqs = still_active
+                self._refill_active_seqs()
+
+            # Single generation step
+            if self.use_kv_cache:
+                logits, new_past_list = self._generate_step_with_kv()
+            else:
+                logits, new_past_list = self._generate_step_without_kv()
+
+            # If no logits returned, skip and advance step
+            if logits is None:
+                step_counter += 1
+                continue
+
+            # Append next token and update KV caches
+            for i, seq in enumerate(self.active_seqs):
+                token = PromptSampler.sample_token(logits[i])
+                seq.append_token(token)
+                if self.use_kv_cache and new_past_list is not None:
+                    seq.kv_cache = new_past_list[i]
+
+            step_counter += 1
+            self._log_gpu_stats(step_counter)
+
+        # Finalize any remaining sequences
+        for seq in self.active_seqs:
+            text = self.tokenizer.decode(seq.get_final_generation(), skip_special_tokens=True)
+            self.results.setdefault(seq.prompt_text, []).append(text)
 
     def _run_generation_continuous(self):
         self._refill_active_seqs()
@@ -242,6 +313,7 @@ class StreamManager:
                         # free KV cache
                         seq.kv_cache=None
                         del seq
+                        self.pbar.update(1)
                     else:
                         still.append(seq)
                 # force collect
@@ -249,13 +321,17 @@ class StreamManager:
                 self.active_seqs=still
                 self._refill_active_seqs()
             # generation step
-            logits, new_past = self._generate_step_with_kv()
+            if self.use_kv_cache:
+                logits, new_past = self._generate_step_with_kv()
+            else:
+                logits, _ = self._generate_step_without_kv()
             if logits is None:
                 step+=1; continue
             for i,seq in enumerate(self.active_seqs):
                 tok = PromptSampler.sample_token(logits[i])
                 seq.append_token(tok)
-                seq.kv_cache = new_past[i]
+                if self.use_kv_cache:
+                    seq.kv_cache = new_past[i]
             step+=1
             self._log_gpu_stats(step)
         # finalize remaining
@@ -264,9 +340,12 @@ class StreamManager:
             self.results.setdefault(seq.prompt_text,[]).append(txt)
 
     def run_generation_loop(self):
+        self.pbar = tqdm(total=self.len_queue, desc="Generating...")
         if self.continuous_batching: self._run_generation_continuous()
         else: self._run_generation_static()
         self.save_results("generation_results.json")
+        self.pbar.close()
+        self.len_queue = 0
 
     def save_results(self, filename):
         ordered={}
