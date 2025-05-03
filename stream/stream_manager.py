@@ -9,6 +9,7 @@ from .prompt_sampler import PromptSampler
 from .kv_cache_manager import KVCacheManager
 from .kv_cache_wrapper import KVCacheWrapper
 from .sequence import Sequence
+from .ngram import NGram
 import pynvml
 from tqdm import tqdm
 import gc
@@ -36,6 +37,9 @@ class StreamManager:
         self.continuous_batching = continuous_batching
         self.debug = debug
         self.logger = logger
+
+        self.ngram_registry = {}
+        self.next_qid = 0
 
         self.gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
 
@@ -75,12 +79,19 @@ class StreamManager:
             print(f"[DEBUG] {msg}")
 
     def enqueue_prompt(self, prompt_text, num_completions=1):
+        # assign a unique qid for this prompt batch
+        qid = self.next_qid
+        self.next_qid += 1
+
+        # track how many sequences will use this n-gram
+        self.ngram_registry[qid] = {'model': None, 'ref_count': num_completions}
+
         self.len_queue += num_completions
         self._debug_print(f"Enqueue prompt: {prompt_text[:60]!r}, num_completions={num_completions}")
-        self.prompt_order.append(prompt_text)
-        self.prompt_deque.append((prompt_text, num_completions))
+        self.prompt_order.append((prompt_text, qid))
+        self.prompt_deque.append((prompt_text, num_completions, qid))
 
-    def _prefill_prompt(self, prompt_text, num_completions):
+    def _prefill_prompt(self, prompt_text, num_completions, qid):
         """
         Prefill a single completion for `prompt_text`, sampling one token.
         On-use of KV caching, initialize and update the cache; otherwise, skip cache calls.
@@ -101,8 +112,14 @@ class StreamManager:
             prompt_text=prompt_text,
             max_length=self.max_length,
             eos_token_id=self.tokenizer.eos_token_id,
+            qid=qid
         )
+
         seq.set_prompt_tokens(prompt_tokens.clone())
+
+        # Lazy-create the n-gram model if needed
+        if self.ngram_registry[qid]['model'] is None:
+            self.ngram_registry[qid]['model'] = NGram(-1, -1, prompt_text)
 
         # Sample the first non-prompt token
         prefix_logits = outputs.logits[0, -1]
@@ -138,11 +155,11 @@ class StreamManager:
         for _ in range(needed):
             if not self.prompt_deque:
                 break
-            p, c = self.prompt_deque.popleft()
-            new = self._prefill_prompt(p, 1)
+            p, c, qid = self.prompt_deque.popleft()
+            new = self._prefill_prompt(p, 1, qid)
             self.active_seqs += new
             if c > 1:
-                self.prompt_deque.append((p, c-1))
+                self.prompt_deque.append((p, c-1, qid))
         # pad to equal length
         if self.active_seqs:
             maxL = max(eff_len(s) for s in self.active_seqs)
@@ -238,6 +255,20 @@ class StreamManager:
 
         logits_tensor = torch.stack(logits_list, dim=0)
         return logits_tensor, None
+
+    def _accept_speculative(self, q_logits: torch.Tensor, p_logits: torch.Tensor) -> torch.BoolTensor:
+        '''
+        Given q_i(x) and p_i(x) for i in [1..gamma],
+        returns a boolean mask of length gamma indicating which speculative tokens to accept contiguously.
+        '''
+        print(q_logits.shape, p_logits.shape)
+        r = torch.rand_like(q_logits)
+        accept = r < (p_logits / q_logits)
+        # enforce contiguous acceptance: stop at first False
+        if not accept.all():
+            first_false = (~accept).nonzero()[0].item()
+            accept[first_false:] = False
+        return accept
 
     def _run_generation_static(self):
         """
