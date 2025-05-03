@@ -263,6 +263,8 @@ class StreamManager:
                         self.results.setdefault(seq.prompt_text, []).append(text)
                         # Free KV cache and sequence
                         seq.kv_cache = None
+                        if self.use_kv_cache:
+                            self.prompt_kv_cache.pop(seq.prompt_text, None)
                         del seq
                         self.pbar.update(1)
                     else:
@@ -310,8 +312,8 @@ class StreamManager:
                     if seq.is_finished() or self.tokenizer.eos_token_id in seq.generated_tokens:
                         txt = self.tokenizer.decode(seq.get_final_generation(), skip_special_tokens=True)
                         self.results.setdefault(seq.prompt_text, []).append(txt)
-                        # free KV cache
-                        seq.kv_cache=None
+                        if self.use_kv_cache:
+                            self.prompt_kv_cache.pop(seq.prompt_text, None)
                         del seq
                         self.pbar.update(1)
                     else:
