@@ -270,6 +270,28 @@ class StreamManager:
             accept[first_false:] = False
         return accept
 
+    def _cleanup_and_refill(self):
+        still_active = []
+        for seq in self.active_seqs:
+            if seq.is_finished() or self.tokenizer.eos_token_id in seq.generated_tokens:
+                # Collect final text
+                text = self.tokenizer.decode(seq.get_final_generation(), skip_special_tokens=True)
+                self.results.setdefault(seq.prompt_text, []).append(text)
+                # Free KV cache and sequence
+                # seq.kv_cache = None
+                if self.use_kv_cache:
+                    self.prompt_kv_cache.pop(seq.prompt_text, None)
+                del seq
+                self.pbar.update(1)
+            else:
+                still_active.append(seq)
+        # Force GC and clear PyTorch cache to release GPU memory
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        self.active_seqs = still_active
+        self._refill_active_seqs()
+
     def _run_generation_static(self):
         """
         Static generation loop refactored to mirror the continuous version's flow:
@@ -286,26 +308,7 @@ class StreamManager:
         while self.active_seqs or self.prompt_deque:
             # Refill at period boundaries
             if step_counter % self.refill_period == 0:
-                still_active = []
-                for seq in self.active_seqs:
-                    if seq.is_finished() or self.tokenizer.eos_token_id in seq.generated_tokens:
-                        # Collect final text
-                        text = self.tokenizer.decode(seq.get_final_generation(), skip_special_tokens=True)
-                        self.results.setdefault(seq.prompt_text, []).append(text)
-                        # Free KV cache and sequence
-                        seq.kv_cache = None
-                        if self.use_kv_cache:
-                            self.prompt_kv_cache.pop(seq.prompt_text, None)
-                        del seq
-                        self.pbar.update(1)
-                    else:
-                        still_active.append(seq)
-                # Force GC and clear PyTorch cache to release GPU memory
-                gc.collect()
-                torch.cuda.empty_cache()
-
-                self.active_seqs = still_active
-                self._refill_active_seqs()
+                self._cleanup_and_refill()
 
             # Single generation step
             if self.use_kv_cache:
@@ -338,21 +341,7 @@ class StreamManager:
         step=0
         while self.active_seqs or self.prompt_deque:
             if step % self.refill_period==0:
-                still=[]
-                for seq in self.active_seqs:
-                    if seq.is_finished() or self.tokenizer.eos_token_id in seq.generated_tokens:
-                        txt = self.tokenizer.decode(seq.get_final_generation(), skip_special_tokens=True)
-                        self.results.setdefault(seq.prompt_text, []).append(txt)
-                        if self.use_kv_cache:
-                            self.prompt_kv_cache.pop(seq.prompt_text, None)
-                        del seq
-                        self.pbar.update(1)
-                    else:
-                        still.append(seq)
-                # force collect
-                gc.collect(); torch.cuda.empty_cache()
-                self.active_seqs=still
-                self._refill_active_seqs()
+                self._cleanup_and_refill()
             # generation step
             if self.use_kv_cache:
                 logits, new_past = self._generate_step_with_kv()
@@ -382,7 +371,7 @@ class StreamManager:
 
     def save_results(self, filename):
         ordered={}
-        for p in self.prompt_order:
+        for p, _ in self.prompt_order:
             ordered[p]=self.results.get(p,[])
         with open(filename,'w') as f:
             json.dump(ordered,f,indent=2)
