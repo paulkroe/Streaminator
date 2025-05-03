@@ -5,16 +5,20 @@ import pickle
 
 def load_random_gsm8k(num_samples=100, seed=42, cache_file="gsm8k_cache.pkl"):
     """
-    Loads the 'main' split of openai/gsm8k from Hugging Face,
-    then randomly selects `num_samples` examples from the train subset.
-    If the data is already cached, it loads from the cache instead.
+    Checks if GSM8K data is cached. If not, downloads it from Hugging Face.
+    Then randomly selects `num_samples` examples from the train subset.
     Each example is a dict with "question" and "answer" keys.
     """
     if os.path.exists(cache_file):
         print(f"Loading cached GSM8K data from {cache_file} ...")
         with open(cache_file, "rb") as f:
             cached_data = pickle.load(f)
-        return cached_data
+        # Ensure the cached data has the requested number of samples
+        if len(cached_data) >= num_samples:
+            return random.sample(cached_data, num_samples)
+        else:
+            print("Cached data has fewer samples than requested. Reloading data...")
+            os.remove(cache_file)
 
     print("Loading GSM8K from Hugging Face (openai/gsm8k) ...")
     ds = load_dataset("openai/gsm8k", "main")
