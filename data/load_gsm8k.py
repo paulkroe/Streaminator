@@ -21,7 +21,7 @@ def load_random_gsm8k(num_samples=100, seed=42, cache_file="gsm8k_cache.pkl"):
             os.remove(cache_file)
 
     print("Loading GSM8K from Hugging Face (openai/gsm8k) ...")
-    ds = load_dataset("openai/gsm8k", "main")
+    ds = load_dataset("openai/gsm8k", "main", ignore_verifications=True)
     train_ds = ds["train"]
     total_train_size = len(train_ds)
     print(f"GSM8K train set size: {total_train_size}")
