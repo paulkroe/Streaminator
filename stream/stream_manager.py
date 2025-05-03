@@ -25,6 +25,7 @@ class StreamManager:
         refill_period=5,
         use_kv_cache=True,
         continuous_batching=True,
+        spec_decoding=True,
         logger=None,
         debug=False
     ):
@@ -35,11 +36,13 @@ class StreamManager:
         self.refill_period = refill_period
         self.use_kv_cache = use_kv_cache
         self.continuous_batching = continuous_batching
+        self.spec_decoding = spec_decoding
         self.debug = debug
         self.logger = logger
 
         self.ngram_registry = {}
         self.next_qid = 0
+        self.n_ngram = 0
 
         self.gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
 
@@ -56,6 +59,9 @@ class StreamManager:
             self.events = self.logger.Table(columns=["step", "prompt"])
 
         self.len_queue = 0
+
+        # TODO this should be a parameter
+        self.gamma = 1
 
     def _log_gpu_stats(self, step):
         if not self.logger:
@@ -119,7 +125,8 @@ class StreamManager:
 
         # Lazy-create the n-gram model if needed
         if self.ngram_registry[qid]['model'] is None:
-            self.ngram_registry[qid]['model'] = NGram(-1, -1, prompt_text)
+            self.ngram_registry[qid]['model'] = NGram(self.tokenizer, self.n_ngram)
+            self.ngram_registry[qid]['model'].train([prompt_text])
 
         # Sample the first non-prompt token
         prefix_logits = outputs.logits[0, -1]
@@ -194,74 +201,12 @@ class StreamManager:
             mask[i, T-v:]=1
         return mask.long()
 
-    def _generate_step_with_kv(self):
-        if not self.active_seqs:
-            return None, None
-        toks, pos, idle = [], [], 0
-        eff_len = lambda s: s.get_valid_length() + (1 if s.is_finished() else 0)
-        for s in self.active_seqs:
-            t = s.next_input_token() or self.tokenizer.eos_token_id
-            if s.is_finished(): idle+=1
-            toks.append(t); pos.append(eff_len(s))
-        if idle==len(self.active_seqs): return None, None
-        input_ids = torch.tensor(toks, device=self.device).unsqueeze(1)
-        position_ids = torch.tensor(pos, device=self.device).unsqueeze(1)
-        batched = self._get_batched_kv()
-        mask = self._build_leftpad_attention_mask()
-        token_mask = torch.ones(len(self.active_seqs),1,device=self.device)
-        mask = torch.cat([mask, token_mask],1)
-        with torch.no_grad():
-            out = self.model(input_ids=input_ids,
-                             position_ids=position_ids,
-                             past_key_values=KVCacheWrapper.wrap(batched,self.model),
-                             use_cache=True,
-                             attention_mask=mask)
-        logits = out.logits[:,-1]
-        new_past = out.past_key_values
-        # split per-seq
-        per=[]
-        for i in range(len(self.active_seqs)):
-            seq_kv=[]
-            for layer in new_past:
-                seq_kv.append((layer[0][i:i+1], layer[1][i:i+1]))
-            per.append(seq_kv)
-        return logits, per
-
-    def _generate_step_without_kv(self):
-        if not self.active_seqs:
-            return None, None
-
-        sequences_inputs = []
-        for seq in self.active_seqs:
-            gen_tensor = torch.tensor(seq.generated_tokens, device=self.device)
-            full_input = torch.cat([seq.prompt_tokens, gen_tensor])
-            sequences_inputs.append(full_input)
-
-        padded = pad_sequence(sequences_inputs, batch_first=True, padding_value=self.tokenizer.eos_token_id).to(self.device)
-        attention_mask = (padded != self.tokenizer.eos_token_id).long().to(self.device)
-
-        with torch.no_grad():
-            outputs = self.model(
-                input_ids=padded,
-                attention_mask=attention_mask,
-                use_cache=False,
-            )
-
-        logits_list = []
-        for i, seq in enumerate(self.active_seqs):
-            seq_len = sequences_inputs[i].shape[0]
-            last_logits = outputs.logits[i, seq_len - 1, :]
-            logits_list.append(last_logits)
-
-        logits_tensor = torch.stack(logits_list, dim=0)
-        return logits_tensor, None
-
     def _accept_speculative(self, q_logits: torch.Tensor, p_logits: torch.Tensor) -> torch.BoolTensor:
         '''
         Given q_i(x) and p_i(x) for i in [1..gamma],
         returns a boolean mask of length gamma indicating which speculative tokens to accept contiguously.
         '''
-        print(q_logits.shape, p_logits.shape)
+        assert q_logits.shape == p_logits.shape
         r = torch.rand_like(q_logits)
         accept = r < (p_logits / q_logits)
         # enforce contiguous acceptance: stop at first False
@@ -292,74 +237,258 @@ class StreamManager:
         self.active_seqs = still_active
         self._refill_active_seqs()
 
+    def _generate_step_with_kv(self, proposals=None):
+        """
+        Unified KV generation: one-token or gamma-step proposals.
+        """
+        if not self.active_seqs:
+            return None, None
+        B = len(self.active_seqs)
+        # non-speculative
+        if proposals is None:
+            toks, pos, idle = [], [], 0
+            eff_len = lambda s: s.get_valid_length() + (1 if s.is_finished() else 0)
+            for s in self.active_seqs:
+                t = s.next_input_token() or self.tokenizer.eos_token_id
+                if s.is_finished(): idle += 1
+                toks.append(t); pos.append(eff_len(s))
+            if idle == B:
+                return None, None
+            input_ids = torch.tensor(toks, device=self.device).unsqueeze(1)
+            position_ids = torch.tensor(pos, device=self.device).unsqueeze(1)
+            batched = self._get_batched_kv()
+            mask = self._build_leftpad_attention_mask()
+            token_mask = torch.ones(B, 1, device=self.device)
+            mask = torch.cat([mask, token_mask], dim=1)
+            with torch.no_grad():
+                out = self.model(
+                    input_ids=input_ids,
+                    position_ids=position_ids,
+                    past_key_values=KVCacheWrapper.wrap(batched, self.model),
+                    use_cache=True,
+                    attention_mask=mask
+                )
+            logits = out.logits[:, -1]
+            new_past = out.past_key_values
+            per = []
+            for i in range(B):
+                seq_kv = []
+                for layer in new_past:
+                    seq_kv.append((layer[0][i:i+1], layer[1][i:i+1]))
+                per.append(seq_kv)
+            return logits, per
+        # speculative proposals
+        gamma = proposals[0].shape[0]
+        proposal_tensor = torch.stack(proposals, dim=0).to(self.device)
+        batched = self._get_batched_kv()
+        base_mask = self._build_leftpad_attention_mask()
+        token_mask = torch.ones(B, gamma, device=self.device)
+        mask = torch.cat([base_mask, token_mask], dim=1)
+        with torch.no_grad():
+            out = self.model(
+                input_ids=proposal_tensor,
+                past_key_values=KVCacheWrapper.wrap(batched, self.model),
+                use_cache=True,
+                attention_mask=mask
+            )
+        return out.logits, out.past_key_values
+
+    def _generate_step_without_kv(self, proposals=None):
+        """
+        Unified non-KV generation: one-token or proposals.
+        """
+        if not self.active_seqs:
+            return None, None
+        if proposals is None:
+            sequences = []
+            for seq in self.active_seqs:
+                gen = torch.tensor(seq.generated_tokens, device=self.device)
+                sequences.append(torch.cat([seq.prompt_tokens, gen]))
+            padded = pad_sequence(sequences, batch_first=True,
+                                  padding_value=self.tokenizer.eos_token_id).to(self.device)
+            mask = (padded != self.tokenizer.eos_token_id).long().to(self.device)
+            with torch.no_grad():
+                out = self.model(
+                    input_ids=padded,
+                    attention_mask=mask,
+                    use_cache=False
+                )
+            logits = torch.stack([out.logits[i, seq.size(0)-1] for i, seq in enumerate(sequences)])
+            return logits, None
+        # speculative proposals
+        batch_inputs = []
+        for i, seq in enumerate(self.active_seqs):
+            prefix = torch.cat([seq.prompt_tokens, torch.tensor(seq.generated_tokens, device=self.device)])
+            batch_inputs.append(torch.cat([prefix, proposals[i].to(self.device)]))
+        padded = pad_sequence(batch_inputs, batch_first=True,
+                              padding_value=self.tokenizer.eos_token_id).to(self.device)
+        mask = (padded != self.tokenizer.eos_token_id).long().to(self.device)
+        with torch.no_grad():
+            out = self.model(
+                input_ids=padded,
+                attention_mask=mask,
+                use_cache=False
+            )
+        return out.logits, None
+
     def _run_generation_static(self):
         """
-        Static generation loop refactored to mirror the continuous version's flow:
-         - Refill at regular intervals
-         - Generate one step per iteration
-         - Clean up finished sequences and free their KV caches
-         - Log GPU stats each generation step
+        Static loop supports spec_decoding flag: if True, fall back to continuous speculative,
+        else do standard static.
         """
-        # Initial refill
+        if self.spec_decoding:
+            # simplest: use continuous speculative loop in static mode
+            return self._run_generation_continuous()
+        # original static
         self._refill_active_seqs()
-        step_counter = 0
-
-        # Continue until all prompts are processed
+        step = 0
         while self.active_seqs or self.prompt_deque:
-            # Refill at period boundaries
-            if step_counter % self.refill_period == 0:
+            if step % self.refill_period == 0:
                 self._cleanup_and_refill()
-
-            # Single generation step
-            if self.use_kv_cache:
-                logits, new_past_list = self._generate_step_with_kv()
-            else:
-                logits, new_past_list = self._generate_step_without_kv()
-
-            # If no logits returned, skip and advance step
+            logits, new_past = (self._generate_step_with_kv() if self.use_kv_cache
+                                 else self._generate_step_without_kv())
             if logits is None:
-                step_counter += 1
+                step += 1
                 continue
-
-            # Append next token and update KV caches
             for i, seq in enumerate(self.active_seqs):
-                token = PromptSampler.sample_token(logits[i])
-                seq.append_token(token)
-                if self.use_kv_cache and new_past_list is not None:
-                    seq.kv_cache = new_past_list[i]
-
-            step_counter += 1
-            self._log_gpu_stats(step_counter)
-
-        # Finalize any remaining sequences
-        for seq in self.active_seqs:
-            text = self.tokenizer.decode(seq.get_final_generation(), skip_special_tokens=True)
-            self.results.setdefault(seq.prompt_text, []).append(text)
-
-    def _run_generation_continuous(self):
-        self._refill_active_seqs()
-        step=0
-        while self.active_seqs or self.prompt_deque:
-            if step % self.refill_period==0:
-                self._cleanup_and_refill()
-            # generation step
-            if self.use_kv_cache:
-                logits, new_past = self._generate_step_with_kv()
-            else:
-                logits, _ = self._generate_step_without_kv()
-            if logits is None:
-                step+=1; continue
-            for i,seq in enumerate(self.active_seqs):
                 tok = PromptSampler.sample_token(logits[i])
                 seq.append_token(tok)
-                if self.use_kv_cache:
+                if self.use_kv_cache and new_past is not None:
                     seq.kv_cache = new_past[i]
-            step+=1
+            step += 1
             self._log_gpu_stats(step)
-        # finalize remaining
         for seq in self.active_seqs:
-            txt=self.tokenizer.decode(seq.get_final_generation(), skip_special_tokens=True)
-            self.results.setdefault(seq.prompt_text,[]).append(txt)
+            txt = self.tokenizer.decode(seq.get_final_generation(), skip_special_tokens=True)
+            self.results.setdefault(seq.prompt_text, []).append(txt)
+
+    def _run_generation_continuous(self):
+        """
+        Continuous generation loop with full n-gram distributions for speculative decoding.
+        """
+        self._refill_active_seqs()
+        step = 0
+        while self.active_seqs or self.prompt_deque:
+            if step % self.refill_period == 0:
+                self._cleanup_and_refill()
+
+            if self.spec_decoding:
+                # 1) Build proposals and collect q-distributions
+                proposals, q_dists = [], []
+                for seq in self.active_seqs:
+                    ngram = self.ngram_registry[seq.qid]['model']
+                    ctx = seq.full_input()
+                    xs, dists = [], []
+                    cur = ctx.clone()
+                    for _ in range(self.gamma):
+                        dist = ngram(cur)               # full dist [vocab_size]
+                        tok_id = dist.argmax().view(1)  # argmax proposal
+                        xs.append(tok_id)
+                        dists.append(dist)
+                        cur = torch.cat([cur, tok_id], dim=0)
+                    proposals.append(torch.cat(xs, dim=0))   # [gamma]
+                    q_dists.append(torch.stack(dists, dim=0)) # [gamma, vocab_size]
+
+                                                # 2) Query LM and split KV caches
+                if self.use_kv_cache:
+                    p_logits, new_past_all = self._generate_step_with_kv(proposals)
+                    # split batched past into per-sequence caches
+                    per_seq_past = []
+                    for idx in range(len(self.active_seqs)):
+                        seq_kv = []
+                        for layer in new_past_all:
+                            seq_kv.append((layer[0][idx:idx+1], layer[1][idx:idx+1]))
+                        per_seq_past.append(seq_kv)
+                else:
+                    p_logits, _ = self._generate_step_without_kv(proposals)
+                    per_seq_past = [None] * len(self.active_seqs)
+                next_active = []
+                for i, seq in enumerate(self.active_seqs):
+                    # convert logits to probabilities
+                    p_probs = torch.softmax(p_logits[i], dim=-1)  # [gamma, vocab_size]
+                    ids = proposals[i]  # [gamma]
+
+                    # extract per-step probabilities
+                    idx = torch.arange(self.gamma, device=ids.device)
+                    p_token_probs = p_probs[idx, ids]
+                    q_token_probs = q_dists[i][idx, ids]
+
+                    # 3) Compute acceptance mask
+                    mask = self._accept_speculative(q_token_probs, p_token_probs)
+
+                    # 4) Append accepted tokens
+                    accepted = ids[mask].tolist()
+                    seq.generated_tokens.extend(accepted)
+                    # find last accepted index for final sampling
+                    accepted_indices = mask.nonzero(as_tuple=False).view(-1)
+                    if accepted_indices.numel() > 0:
+                        final_idx = accepted_indices[-1].item()
+                    else:
+                        final_idx = 0
+
+                    # 5) Final token from LM at index final_idx
+                    final_dist = p_probs[final_idx]
+                    t = PromptSampler.sample_token(final_dist)
+                    seq.generated_tokens.append(int(t))
+
+                    # update KV cache if used
+                    if self.use_kv_cache and new_past_all is not None:
+                        # split batched past into per-sequence caches
+                        seq_kv = []
+                        for layer_k, layer_v in new_past_all:
+                            # layer_k, layer_v have shape [B, T, ...]
+                            seq_kv.append((layer_k[i:i+1], layer_v[i:i+1]))
+                        seq.kv_cache = seq_kv
+
+                    # finalize or keep active
+                    if seq.is_finished():
+                        txt = self.tokenizer.decode(seq.full_input(), skip_special_tokens=True)
+                        self.results.setdefault(seq.prompt_text, []).append(txt)
+                        self.pbar.update(1)
+                        reg = self.ngram_registry[seq.qid]
+                        reg['ref_count'] -= 1
+                        if reg['ref_count'] == 0:
+                            del self.ngram_registry[seq.qid]
+                    else:
+                        next_active.append(seq)
+
+                self.active_seqs = next_active
+
+            else:
+                # regular single-token continuous generation
+                logits, new_past = (
+                    self._generate_step_with_kv() if self.use_kv_cache
+                    else self._generate_step_without_kv()
+                )
+                if logits is None:
+                    step += 1
+                    continue
+
+                next_active = []
+                for i, seq in enumerate(self.active_seqs):
+                    tok = PromptSampler.sample_token(logits[i])
+                    seq.append_token(tok)
+                    if self.use_kv_cache:
+                        seq.kv_cache = new_past[i]
+                    if seq.is_finished():
+                        txt = self.tokenizer.decode(seq.full_input(), skip_special_tokens=True)
+                        self.results.setdefault(seq.prompt_text, []).append(txt)
+                        self.pbar.update(1)
+                        reg = self.ngram_registry.get(seq.qid)
+                        if reg:
+                            reg['ref_count'] -= 1
+                            if reg['ref_count'] == 0:
+                                del self.ngram_registry[seq.qid]
+                    else:
+                        next_active.append(seq)
+                self.active_seqs = next_active
+
+            step += 1
+            self._log_gpu_stats(step)
+
+        # finalize leftovers
+        for seq in self.active_seqs:
+            txt = self.tokenizer.decode(seq.get_full_input(), skip_special_tokens=True)
+            self.results.setdefault(seq.prompt_text, []).append(txt)
 
     def run_generation_loop(self):
         self.pbar = tqdm(total=self.len_queue, desc="Generating...")

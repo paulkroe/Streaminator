@@ -18,7 +18,7 @@ import gc
 
 def main():
     # 1) Load a random sample of GSM8K examples from Hugging Face.
-    num_samples = 32
+    num_samples = 10
     examples = load_random_gsm8k(num_samples=num_samples, seed=42)
 
     # 2) Load model and tokenizer.
@@ -30,11 +30,12 @@ def main():
     model.eval()
 
     # 3) Set up the stream manager with your parameters.
-    stream_width = 16
-    max_length = 250
-    use_kv_cache = True
+    stream_width = 32
+    max_length = 100
+    use_kv_cache =  True
     continuous_batching = True
-    num_completions = 2
+    spec_decoding = True
+    num_completions = 4
 
     wandb.init(
         project="pipeline-profiling",
@@ -47,6 +48,7 @@ def main():
             "num_completions": num_completions,
             "use_kv_cache": use_kv_cache,
             "continuous_batching": continuous_batching,
+            "spec_decoding": spec_decoding,
         }
     )
 
@@ -57,6 +59,7 @@ def main():
         max_length=max_length,
         use_kv_cache=use_kv_cache,
         continuous_batching=continuous_batching,
+        spec_decoding=spec_decoding,
         logger=wandb
     )
 
