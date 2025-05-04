@@ -57,12 +57,23 @@ class Sequence:
         valid_length = self.get_valid_length()
         prompt_length = len(self.prompt_tokens)
         
+        # Debug information about token lengths
+        print(f"[TOKEN DEBUG] qid={self.qid}, valid_length={valid_length}, prompt_length={prompt_length}")
+        print(f"[TOKEN DEBUG] generated_tokens={self.generated_tokens}, length_mask={self.length_mask}")
+        
         # Ensure we have valid generated tokens (not just prompt tokens)
         if valid_length <= prompt_length:
+            print(f"[TOKEN DEBUG] No valid generated tokens (valid_length <= prompt_length)")
+            # Instead of returning an empty list, return all generated tokens
+            # This ensures we at least return something for evaluation
+            if self.generated_tokens:
+                print(f"[TOKEN DEBUG] Returning all generated tokens as fallback")
+                return self.generated_tokens
             return []  # No valid generated tokens
             
         # Only include tokens that have mask=1 (valid tokens, not padding)
         valid_generated = self.generated_tokens[: (valid_length - prompt_length)]
+        print(f"[TOKEN DEBUG] returning valid_generated={valid_generated}")
         return valid_generated
 
     def set_prompt_tokens(self, tokens):

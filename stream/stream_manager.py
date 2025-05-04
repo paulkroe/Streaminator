@@ -305,6 +305,13 @@ class StreamManager:
                     print(f"Final text: {self.tokenizer.decode(seq.generated_tokens, skip_special_tokens=False)}")
                 # Collect final text
                 text = self.tokenizer.decode(seq.get_final_generation(), skip_special_tokens=True)
+                if not text.strip():  # If text is empty or just whitespace
+                    print(f"WARNING: Empty completion text for sequence {seq.qid}")
+                    if seq.generated_tokens:
+                        # Fallback: use all generated tokens
+                        print(f"Using fallback: all generated tokens for seq {seq.qid}")
+                        text = self.tokenizer.decode(seq.generated_tokens, skip_special_tokens=True)
+                
                 if self.debug:
                     print(f"Adding completion for prompt '{seq.prompt_text[:30]}...': '{text[:30]}...'")
                 self.results.setdefault(seq.prompt_text, []).append(text)
@@ -618,14 +625,42 @@ class StreamManager:
         self.pbar = tqdm(total=self.len_queue, desc="Generating...")
         if self.continuous_batching: self._run_generation_continuous()
         else: self._run_generation_static()
+        
+        # Validate results dictionary
+        print("\n--- RESULTS DICTIONARY VALIDATION ---")
+        if not self.results:
+            print("ERROR: Results dictionary is empty!")
+        else:
+            print(f"Results contains {len(self.results)} prompts with completions:")
+            for prompt, completions in self.results.items():
+                print(f"  Prompt: '{prompt[:30]}...' has {len(completions)} completions")
+                for i, completion in enumerate(completions):
+                    print(f"    Completion {i+1}: '{completion[:60]}...'")
+        
         self.save_results("generation_results.json")
         self.pbar.close()
         self.len_queue = 0
 
     def save_results(self, filename):
-        ordered={}
+        ordered = {}
         for p, _ in self.prompt_order:
-            ordered[p]=self.results.get(p,[])
-        with open(filename,'w') as f:
-            json.dump(ordered,f,indent=2)
+            completions = self.results.get(p, [])
+            # Fail-safe: If no completions, add an empty string as completion
+            if not completions:
+                print(f"WARNING: No completions for prompt '{p[:30]}...', adding empty string")
+                completions = [""]
+            ordered[p] = completions
+            
+        with open(filename, 'w') as f:
+            json.dump(ordered, f, indent=2)
         print(f"Results saved to {filename}")
+        
+        # Final verification
+        print(f"Final results contains {len(ordered)} prompts")
+        for prompt, completions in ordered.items():
+            if not completions:
+                print(f"ERROR: Still no completions for '{prompt[:30]}...'")
+            elif all(not c.strip() for c in completions):
+                print(f"WARNING: Only empty completions for '{prompt[:30]}...'")
+            else:
+                print(f"OK: Prompt '{prompt[:30]}...' has {len(completions)} completions")

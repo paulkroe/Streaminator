@@ -62,7 +62,8 @@ def main():
         use_kv_cache=use_kv_cache,
         continuous_batching=continuous_batching,
         spec_decoding=spec_decoding,
-        logger=wandb
+        logger=wandb,
+        debug=True
     )
 
     print(f"Stream manager initialized: stream_width={stream_width}, max_length={max_length}")
