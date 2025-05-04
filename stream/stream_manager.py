@@ -36,7 +36,7 @@ class StreamManager:
         self.refill_period = refill_period
         self.use_kv_cache = use_kv_cache
         self.continuous_batching = continuous_batching
-        self.spec_decoding = spec_decoding
+        self.spec_decoding = False
         self.debug = debug
         self.logger = logger
 
@@ -444,11 +444,33 @@ class StreamManager:
                     # update KV cache
                     if self.use_kv_cache:
                         seq.kv_cache = per_seq_past[i]
-
-                    # After updating each seq.kv_cache: TODO fix this
-                    # problem is that if we add different lengths we have different lengths in the KV cache
-                    self._cleanup_and_refill()
-
+                    
+                    # Check if sequence is finished
+                    if seq.is_finished():
+                        # Don't add to next_active
+                        continue
+                    next_active.append(seq)
+                
+                # Update active sequences
+                self.active_seqs = next_active
+                
+                # Pad KV caches to equal length after all sequences are processed
+                if self.use_kv_cache and self.active_seqs:
+                    # Calculate effective length for each sequence
+                    eff_len = lambda s: s.get_valid_length() + (1 if s.is_finished() else 0)
+                    maxL = max(eff_len(s) for s in self.active_seqs)
+                    
+                    # Pad each sequence's KV cache to maxL
+                    for seq in self.active_seqs:
+                        L = eff_len(seq)
+                        pad = maxL - L
+                        if pad > 0:
+                            seq.kv_cache = [(
+                                F.pad(k, (0, 0, pad, 0)),
+                                F.pad(v, (0, 0, pad, 0))
+                            ) for k, v in seq.kv_cache]
+                
+                self._cleanup_and_refill()
 
             else:
                 # regular single-token continuous generation
