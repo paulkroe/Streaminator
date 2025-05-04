@@ -152,11 +152,55 @@ class StreamManager:
         seq.append_token(first_token)
         return [seq]
 
+    def _align_kv_cache_lengths(self):
+        """
+        Ensures all KV caches in active_seqs have the same sequence length
+        by padding shorter ones to match the longest.
+        """
+        if not self.active_seqs or not self.use_kv_cache:
+            return
+
+        # Calculate effective length for each sequence
+        eff_len = lambda s: s.get_valid_length() + (1 if s.is_finished() else 0)
+        
+        # Find the maximum length across all sequences
+        maxL = max(eff_len(s) for s in self.active_seqs)
+        
+        if self.debug:
+            print(f"\n--- Aligning KV caches to max length {maxL} ---")
+            kv_shapes = []
+            for i, seq in enumerate(self.active_seqs):
+                if seq.kv_cache and len(seq.kv_cache) > 0:
+                    kv_shapes.append((i, seq.kv_cache[0][0].shape[2]))
+            print(f"Before alignment: {kv_shapes}")
+        
+        # Pad each sequence's KV cache to maxL
+        for seq in self.active_seqs:
+            if not seq.kv_cache:
+                continue
+                
+            L = eff_len(seq)
+            pad = maxL - L
+            if pad > 0:
+                seq.kv_cache = [(
+                    F.pad(k, (0, 0, pad, 0)),
+                    F.pad(v, (0, 0, pad, 0))
+                ) for k, v in seq.kv_cache]
+        
+        if self.debug:
+            kv_shapes = []
+            for i, seq in enumerate(self.active_seqs):
+                if seq.kv_cache and len(seq.kv_cache) > 0:
+                    kv_shapes.append((i, seq.kv_cache[0][0].shape[2]))
+            print(f"After alignment: {kv_shapes}")
+
     def _refill_active_seqs(self):
         eff_len = lambda s: s.get_valid_length() + (1 if s.is_finished() else 0)
         # trim old
         for seq in self.active_seqs:
             L = eff_len(seq)
+            if self.debug:
+                print(f"Trimming seq {seq.qid} to length {L}, valid_length={seq.get_valid_length()}, finished={seq.is_finished()}")
             seq.kv_cache = [(k[..., -L:, :], v[..., -L:, :]) for k, v in seq.kv_cache]
         # add new
         needed = self.stream_width - len(self.active_seqs)
@@ -168,27 +212,43 @@ class StreamManager:
             self.active_seqs += new
             if c > 1:
                 self.prompt_deque.append((p, c-1, qid))
-        # pad to equal length
-        if self.active_seqs:
-            maxL = max(eff_len(s) for s in self.active_seqs)
-            for seq in self.active_seqs:
-                L = eff_len(seq)
-                pad = maxL - L
-                if pad>0:
-                    seq.kv_cache = [(
-                        F.pad(k, (0,0,pad,0)),
-                        F.pad(v, (0,0,pad,0))
-                    ) for k,v in seq.kv_cache]
+        
+        # Ensure all KV caches are of the same length
+        self._align_kv_cache_lengths()
 
     def _get_batched_kv(self):
         if not self.active_seqs:
             return None
         layers = len(self.active_seqs[0].kv_cache)
         batched=[]
+        
+        # Debug: Print lengths of all KV caches
+        if self.debug:
+            print("\n--- KV Cache Dimensions ---")
+            for i, seq in enumerate(self.active_seqs):
+                for layer_idx, (k, v) in enumerate(seq.kv_cache):
+                    print(f"Seq {i}, Layer {layer_idx}: K shape {k.shape}, V shape {v.shape}")
+        
         for i in range(layers):
             ks = [s.kv_cache[i][0] for s in self.active_seqs]
             vs = [s.kv_cache[i][1] for s in self.active_seqs]
-            batched.append((torch.cat(ks,0), torch.cat(vs,0)))
+            
+            # Debug: Check if all tensors in this layer have same dimensions
+            if self.debug and len(ks) > 1:
+                shapes_k = [k.shape for k in ks]
+                shapes_v = [v.shape for v in vs]
+                print(f"Layer {i} Key shapes: {shapes_k}")
+                print(f"Layer {i} Value shapes: {shapes_v}")
+            
+            try:
+                batched.append((torch.cat(ks,0), torch.cat(vs,0)))
+            except RuntimeError as e:
+                if self.debug:
+                    print(f"Error concatenating at layer {i}: {e}")
+                    print(f"Key tensor shapes: {[k.shape for k in ks]}")
+                    print(f"Value tensor shapes: {[v.shape for v in vs]}")
+                raise  # Re-raise the exception
+                
         return tuple(batched)
 
     def _build_leftpad_attention_mask(self):
@@ -397,6 +457,9 @@ class StreamManager:
                     proposals.append(torch.cat(xs, dim=0))     # [gamma]
                     q_dists.append(torch.stack(dists, dim=0))  # [gamma, vocab_size]
 
+                # Ensure KV caches are aligned before running model
+                self._align_kv_cache_lengths()
+
                 # 2) Run LM and split KV caches
                 B = len(self.active_seqs)
                 if self.use_kv_cache:
@@ -425,7 +488,8 @@ class StreamManager:
 
                     # append accepted proposal tokens
                     accepted_ids = ids[mask].tolist()
-                    print(accepted_ids)
+                    if self.debug:
+                        print(f"Sequence {i} (qid={seq.qid}): Accepted {len(accepted_ids)} tokens")
                     for tok in accepted_ids:
                         seq.append_token(int(tok))
 
@@ -443,38 +507,36 @@ class StreamManager:
 
                     # update KV cache
                     if self.use_kv_cache:
+                        if self.debug:
+                            old_shapes = [k.shape for k, _ in seq.kv_cache]
+                            new_shapes = [k.shape for k, _ in per_seq_past[i]]
+                            print(f"Seq {i} (qid={seq.qid}): Old KV key shapes: {old_shapes}")
+                            print(f"Seq {i} (qid={seq.qid}): New KV key shapes: {new_shapes}")
                         seq.kv_cache = per_seq_past[i]
                     
                     # Check if sequence is finished
                     if seq.is_finished():
                         # Don't add to next_active
+                        if self.debug:
+                            print(f"Sequence {i} (qid={seq.qid}) is finished and removed")
                         continue
                     next_active.append(seq)
                 
                 # Update active sequences
                 self.active_seqs = next_active
                 
-                # Pad KV caches to equal length after all sequences are processed
+                # Ensure KV caches are aligned after updating
                 if self.use_kv_cache and self.active_seqs:
-                    # Calculate effective length for each sequence
-                    eff_len = lambda s: s.get_valid_length() + (1 if s.is_finished() else 0)
-                    maxL = max(eff_len(s) for s in self.active_seqs)
-                    
-                    # Pad each sequence's KV cache to maxL
-                    for seq in self.active_seqs:
-                        L = eff_len(seq)
-                        pad = maxL - L
-                        if pad > 0:
-                            seq.kv_cache = [(
-                                F.pad(k, (0, 0, pad, 0)),
-                                F.pad(v, (0, 0, pad, 0))
-                            ) for k, v in seq.kv_cache]
+                    self._align_kv_cache_lengths()
                 
                 # Now do a single cleanup and refill after all sequences are processed
                 self._cleanup_and_refill()
 
             else:
                 # regular single-token continuous generation
+                # Ensure KV caches are aligned before running model
+                self._align_kv_cache_lengths()
+                
                 logits, new_past = (
                     self._generate_step_with_kv() if self.use_kv_cache
                     else self._generate_step_without_kv()
@@ -501,6 +563,10 @@ class StreamManager:
                     else:
                         next_active.append(seq)
                 self.active_seqs = next_active
+                
+                # Ensure KV caches are aligned after updating
+                if self.use_kv_cache and self.active_seqs:
+                    self._align_kv_cache_lengths()
 
             step += 1
             self._log_gpu_stats(step)
