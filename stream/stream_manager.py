@@ -42,7 +42,7 @@ class StreamManager:
 
         self.ngram_registry = {}
         self.next_qid = 0
-        self.n_ngram = 3  # Setting to a reasonable default of n=3 for efficient n-gram predictions
+        self.n_ngram = 3   
 
         self.gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
 
@@ -61,7 +61,7 @@ class StreamManager:
         self.len_queue = 0
 
         # Number of tokens to generate speculatively per step
-        self.gamma = 4  # Setting to 4 tokens for better speculative decoding performance
+        self.gamma = 4
 
     def _log_gpu_stats(self, step):
         if not self.logger:

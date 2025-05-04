@@ -36,7 +36,7 @@ def main():
     max_length = 100
     use_kv_cache =  True
     continuous_batching = True
-    spec_decoding = True
+    spec_decoding = False
     num_completions = 4
 
     wandb.init(
