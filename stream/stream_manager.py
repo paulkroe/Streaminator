@@ -42,7 +42,7 @@ class StreamManager:
 
         self.ngram_registry = {}
         self.next_qid = 0
-        self.n_ngram = 0
+        self.n_ngram = 3  # Setting to a reasonable default of n=3 for efficient n-gram predictions
 
         self.gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
 
@@ -60,8 +60,8 @@ class StreamManager:
 
         self.len_queue = 0
 
-        # TODO this should be a parameter
-        self.gamma = 1
+        # Number of tokens to generate speculatively per step
+        self.gamma = 4  # Setting to 4 tokens for better speculative decoding performance
 
     def _log_gpu_stats(self, step):
         if not self.logger:
@@ -588,7 +588,10 @@ class StreamManager:
                     if self.use_kv_cache:
                         seq.kv_cache = new_past[i]
                     if seq.is_finished():
-                        txt = self.tokenizer.decode(seq.full_input(), skip_special_tokens=True)
+                        txt = self.tokenizer.decode(seq.get_final_generation(), skip_special_tokens=True)
+                        if self.debug:
+                            print(f"Non-spec mode: Adding completion for prompt '{seq.prompt_text[:30]}...': '{txt[:30]}...'")
+                            print(f"Generated tokens: {seq.generated_tokens}")
                         self.results.setdefault(seq.prompt_text, []).append(txt)
                         self.pbar.update(1)
                         if self.spec_decoding and seq.qid in self.ngram_registry:
@@ -605,7 +608,10 @@ class StreamManager:
 
         # finalize leftovers
         for seq in self.active_seqs:
-            txt = self.tokenizer.decode(seq.full_input(), skip_special_tokens=True)
+            txt = self.tokenizer.decode(seq.get_final_generation(), skip_special_tokens=True)
+            if self.debug:
+                print(f"Finalizing leftover sequence: '{txt[:30]}...'")
+                print(f"Generated tokens: {seq.generated_tokens}")
             self.results.setdefault(seq.prompt_text, []).append(txt)
 
     def run_generation_loop(self):

@@ -54,7 +54,15 @@ class Sequence:
         Returns the generated tokens that are valid (i.e. tokens with mask 1, excluding dummy tokens).
         """
         # Valid generated tokens = valid tokens minus prompt tokens.
-        valid_generated = self.generated_tokens[: (self.get_valid_length() - len(self.prompt_tokens))]
+        valid_length = self.get_valid_length()
+        prompt_length = len(self.prompt_tokens)
+        
+        # Ensure we have valid generated tokens (not just prompt tokens)
+        if valid_length <= prompt_length:
+            return []  # No valid generated tokens
+            
+        # Only include tokens that have mask=1 (valid tokens, not padding)
+        valid_generated = self.generated_tokens[: (valid_length - prompt_length)]
         return valid_generated
 
     def set_prompt_tokens(self, tokens):
