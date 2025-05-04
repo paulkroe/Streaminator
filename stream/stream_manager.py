@@ -36,7 +36,7 @@ class StreamManager:
         self.refill_period = refill_period
         self.use_kv_cache = use_kv_cache
         self.continuous_batching = continuous_batching
-        self.spec_decoding = False
+        self.spec_decoding = spec_decoding
         self.debug = debug
         self.logger = logger
 
@@ -125,7 +125,7 @@ class StreamManager:
         seq.set_prompt_tokens(prompt_tokens.clone())
 
         # Lazy-create the n-gram model if needed
-        if self.ngram_registry[qid]['model'] is None:
+        if self.spec_decoding and qid in self.ngram_registry and self.ngram_registry[qid]['model'] is None:
             self.ngram_registry[qid]['model'] = NGram(self.tokenizer, self.n_ngram)
             self.ngram_registry[qid]['model'].train([prompt_text])
 
@@ -228,7 +228,7 @@ class StreamManager:
                 self.results.setdefault(seq.prompt_text, []).append(text)
                 # Free KV cache and sequence
                 # seq.kv_cache = None
-                if self.spec_decoding:
+                if self.spec_decoding and seq.qid in self.ngram_registry:
                     reg = self.ngram_registry[seq.qid]
                     reg['ref_count'] -= 1
                     if reg['ref_count'] == 0:
@@ -470,6 +470,7 @@ class StreamManager:
                                 F.pad(v, (0, 0, pad, 0))
                             ) for k, v in seq.kv_cache]
                 
+                # Now do a single cleanup and refill after all sequences are processed
                 self._cleanup_and_refill()
 
             else:
@@ -492,8 +493,8 @@ class StreamManager:
                         txt = self.tokenizer.decode(seq.full_input(), skip_special_tokens=True)
                         self.results.setdefault(seq.prompt_text, []).append(txt)
                         self.pbar.update(1)
-                        reg = self.ngram_registry.get(seq.qid)
-                        if reg:
+                        if self.spec_decoding and seq.qid in self.ngram_registry:
+                            reg = self.ngram_registry[seq.qid]
                             reg['ref_count'] -= 1
                             if reg['ref_count'] == 0:
                                 del self.ngram_registry[seq.qid]
