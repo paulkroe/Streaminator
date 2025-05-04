@@ -17,25 +17,15 @@ import pynvml
 import gc
 
 def main():
-    HUGGINGFACE_TOKEN =
-    # Replace with your token
-    # If using Llama-3.2-1B
-    # make sure you have requested access at
-    # https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct
-
-    if not HUGGINGFACE_TOKEN:
-        raise ValueError("Please set your Hugging Face token in the HUGGINGFACE_TOKEN variable.")
-
     # 1) Load a random sample of GSM8K examples from Hugging Face.
     num_samples = 10
     examples = load_random_gsm8k(num_samples=num_samples, seed=42)
 
     # 2) Load model and tokenizer.
     model_name = "meta-llama/Llama-3.2-1B-Instruct"
-    tokenizer = AutoTokenizer.from_pretrained(model_name, use_auth_token=HUGGINGFACE_TOKEN)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        use_auth_token=HUGGINGFACE_TOKEN
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
