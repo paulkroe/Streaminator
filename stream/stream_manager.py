@@ -42,7 +42,7 @@ class StreamManager:
 
         self.ngram_registry = {}
         self.next_qid = 0
-        self.n_ngram = 3   
+        self.n_ngram = 3  # default n=3 for ngrams
 
         self.gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
 
@@ -60,7 +60,7 @@ class StreamManager:
 
         self.len_queue = 0
 
-        # Number of tokens to generate speculatively per step
+        # tokens to generate per step
         self.gamma = 4
 
     def _log_gpu_stats(self, step):
@@ -154,8 +154,7 @@ class StreamManager:
 
     def _align_kv_cache_lengths(self):
         """
-        Ensures all KV caches in active_seqs have the same sequence length
-        by padding shorter ones to match the longest.
+        Ensures all KV caches have same sequence length by padding shorter ones
         """
         if not self.active_seqs or not self.use_kv_cache:
             return
@@ -166,11 +165,10 @@ class StreamManager:
                 print("Some sequences don't have KV caches, skipping alignment")
             return
             
-        # Get the third dimension (sequence length) of each KV cache
+        # Get sequence lengths
         seq_lengths = []
         for seq in self.active_seqs:
             if seq.kv_cache and len(seq.kv_cache) > 0:
-                # Get sequence length from the first layer's key
                 seq_lengths.append(seq.kv_cache[0][0].shape[2])
         
         if not seq_lengths:
@@ -187,12 +185,11 @@ class StreamManager:
                     kv_shapes.append((i, seq.kv_cache[0][0].shape[2]))
             print(f"Before alignment: {kv_shapes}")
         
-        # Pad each sequence's KV cache to maxL
+        # Pad each sequence
         for seq in self.active_seqs:
             if not seq.kv_cache or not len(seq.kv_cache):
                 continue
                 
-            # Get current sequence length from KV cache
             currL = seq.kv_cache[0][0].shape[2]
             pad = maxL - currL
             
@@ -305,10 +302,10 @@ class StreamManager:
                     print(f"Final text: {self.tokenizer.decode(seq.generated_tokens, skip_special_tokens=False)}")
                 # Collect final text
                 text = self.tokenizer.decode(seq.get_final_generation(), skip_special_tokens=True)
-                if not text.strip():  # If text is empty or just whitespace
+                if not text.strip():  # empty text
                     print(f"WARNING: Empty completion text for sequence {seq.qid}")
                     if seq.generated_tokens:
-                        # Fallback: use all generated tokens
+                        # try all tokens
                         print(f"Using fallback: all generated tokens for seq {seq.qid}")
                         text = self.tokenizer.decode(seq.generated_tokens, skip_special_tokens=True)
                 
@@ -626,16 +623,14 @@ class StreamManager:
         if self.continuous_batching: self._run_generation_continuous()
         else: self._run_generation_static()
         
-        # Validate results dictionary
-        print("\n--- RESULTS DICTIONARY VALIDATION ---")
+        # check results
+        print("\n--- RESULTS CHECK ---")
         if not self.results:
-            print("ERROR: Results dictionary is empty!")
+            print("ERROR: Results dict empty!")
         else:
-            print(f"Results contains {len(self.results)} prompts with completions:")
+            print(f"Results has {len(self.results)} prompts")
             for prompt, completions in self.results.items():
-                print(f"  Prompt: '{prompt[:30]}...' has {len(completions)} completions")
-                for i, completion in enumerate(completions):
-                    print(f"    Completion {i+1}: '{completion[:60]}...'")
+                print(f"  '{prompt[:30]}...' -> {len(completions)} completions")
         
         self.save_results("generation_results.json")
         self.pbar.close()
@@ -645,7 +640,7 @@ class StreamManager:
         ordered = {}
         for p, _ in self.prompt_order:
             completions = self.results.get(p, [])
-            # Fail-safe: If no completions, add an empty string as completion
+            # add empty string if no completions
             if not completions:
                 print(f"WARNING: No completions for prompt '{p[:30]}...', adding empty string")
                 completions = [""]
@@ -655,7 +650,7 @@ class StreamManager:
             json.dump(ordered, f, indent=2)
         print(f"Results saved to {filename}")
         
-        # Final verification
+        # quick verification
         print(f"Final results contains {len(ordered)} prompts")
         for prompt, completions in ordered.items():
             if not completions:

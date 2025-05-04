@@ -61,17 +61,16 @@ class Sequence:
         print(f"[TOKEN DEBUG] qid={self.qid}, valid_length={valid_length}, prompt_length={prompt_length}")
         print(f"[TOKEN DEBUG] generated_tokens={self.generated_tokens}, length_mask={self.length_mask}")
         
-        # Ensure we have valid generated tokens (not just prompt tokens)
+        # No valid tokens? 
         if valid_length <= prompt_length:
             print(f"[TOKEN DEBUG] No valid generated tokens (valid_length <= prompt_length)")
-            # Instead of returning an empty list, return all generated tokens
-            # This ensures we at least return something for evaluation
+            # Return all tokens as fallback
             if self.generated_tokens:
-                print(f"[TOKEN DEBUG] Returning all generated tokens as fallback")
+                print(f"[TOKEN DEBUG] Using all generated tokens")
                 return self.generated_tokens
-            return []  # No valid generated tokens
+            return []
             
-        # Only include tokens that have mask=1 (valid tokens, not padding)
+        # Return only valid tokens
         valid_generated = self.generated_tokens[: (valid_length - prompt_length)]
         print(f"[TOKEN DEBUG] returning valid_generated={valid_generated}")
         return valid_generated
