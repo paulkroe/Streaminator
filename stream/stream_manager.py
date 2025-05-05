@@ -42,7 +42,7 @@ class StreamManager:
 
         self.ngram_registry = {}
         self.next_qid = 0
-        self.n_ngram = 3  # default n=3 for ngrams
+        self.n_ngram = 0
 
         self.gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
 
@@ -60,8 +60,8 @@ class StreamManager:
 
         self.len_queue = 0
 
-        # tokens to generate per step
-        self.gamma = 4
+        # TODO this should be a parameter
+        self.gamma = 1
 
     def _log_gpu_stats(self, step):
         if not self.logger:
@@ -125,7 +125,7 @@ class StreamManager:
         seq.set_prompt_tokens(prompt_tokens.clone())
 
         # Lazy-create the n-gram model if needed
-        if self.spec_decoding and qid in self.ngram_registry and self.ngram_registry[qid]['model'] is None:
+        if self.ngram_registry[qid]['model'] is None:
             self.ngram_registry[qid]['model'] = NGram(self.tokenizer, self.n_ngram)
             self.ngram_registry[qid]['model'].train([prompt_text])
 
@@ -152,67 +152,11 @@ class StreamManager:
         seq.append_token(first_token)
         return [seq]
 
-    def _align_kv_cache_lengths(self):
-        """
-        Ensures all KV caches have same sequence length by padding shorter ones
-        """
-        if not self.active_seqs or not self.use_kv_cache:
-            return
-
-        # Check if all sequences have KV caches
-        if any(not hasattr(seq, 'kv_cache') or not seq.kv_cache for seq in self.active_seqs):
-            if self.debug:
-                print("Some sequences don't have KV caches, skipping alignment")
-            return
-            
-        # Get sequence lengths
-        seq_lengths = []
-        for seq in self.active_seqs:
-            if seq.kv_cache and len(seq.kv_cache) > 0:
-                seq_lengths.append(seq.kv_cache[0][0].shape[2])
-        
-        if not seq_lengths:
-            return
-            
-        # Find the maximum length
-        maxL = max(seq_lengths)
-        
-        if self.debug:
-            print(f"\n--- Aligning KV caches to max length {maxL} ---")
-            kv_shapes = []
-            for i, seq in enumerate(self.active_seqs):
-                if seq.kv_cache and len(seq.kv_cache) > 0:
-                    kv_shapes.append((i, seq.kv_cache[0][0].shape[2]))
-            print(f"Before alignment: {kv_shapes}")
-        
-        # Pad each sequence
-        for seq in self.active_seqs:
-            if not seq.kv_cache or not len(seq.kv_cache):
-                continue
-                
-            currL = seq.kv_cache[0][0].shape[2]
-            pad = maxL - currL
-            
-            if pad > 0:
-                seq.kv_cache = [(
-                    F.pad(k, (0, 0, pad, 0)),
-                    F.pad(v, (0, 0, pad, 0))
-                ) for k, v in seq.kv_cache]
-        
-        if self.debug:
-            kv_shapes = []
-            for i, seq in enumerate(self.active_seqs):
-                if seq.kv_cache and len(seq.kv_cache) > 0:
-                    kv_shapes.append((i, seq.kv_cache[0][0].shape[2]))
-            print(f"After alignment: {kv_shapes}")
-
     def _refill_active_seqs(self):
         eff_len = lambda s: s.get_valid_length() + (1 if s.is_finished() else 0)
         # trim old
         for seq in self.active_seqs:
             L = eff_len(seq)
-            if self.debug:
-                print(f"Trimming seq {seq.qid} to length {L}, valid_length={seq.get_valid_length()}, finished={seq.is_finished()}")
             seq.kv_cache = [(k[..., -L:, :], v[..., -L:, :]) for k, v in seq.kv_cache]
         # add new
         needed = self.stream_width - len(self.active_seqs)
@@ -224,48 +168,27 @@ class StreamManager:
             self.active_seqs += new
             if c > 1:
                 self.prompt_deque.append((p, c-1, qid))
-        
-        # Ensure all KV caches are of the same length
-        self._align_kv_cache_lengths()
+        # pad to equal length
+        if self.active_seqs:
+            maxL = max(eff_len(s) for s in self.active_seqs)
+            for seq in self.active_seqs:
+                L = eff_len(seq)
+                pad = maxL - L
+                if pad>0:
+                    seq.kv_cache = [(
+                        F.pad(k, (0,0,pad,0)),
+                        F.pad(v, (0,0,pad,0))
+                    ) for k,v in seq.kv_cache]
 
     def _get_batched_kv(self):
         if not self.active_seqs:
             return None
-        
-        # Always ensure alignment before batching
-        self._align_kv_cache_lengths()
-        
         layers = len(self.active_seqs[0].kv_cache)
         batched=[]
-        
-        # Debug: Print lengths of all KV caches
-        if self.debug:
-            print("\n--- KV Cache Dimensions After Final Alignment ---")
-            for i, seq in enumerate(self.active_seqs):
-                for layer_idx, (k, v) in enumerate(seq.kv_cache):
-                    if layer_idx == 0:  # Only print first layer to avoid too much output
-                        print(f"Seq {i}, Layer 0: K shape {k.shape}")
-        
         for i in range(layers):
             ks = [s.kv_cache[i][0] for s in self.active_seqs]
             vs = [s.kv_cache[i][1] for s in self.active_seqs]
-            
-            # Debug: Check if all tensors in this layer have same dimensions
-            if self.debug and len(ks) > 1:
-                shapes_k = [k.shape for k in ks]
-                shapes_v = [v.shape for v in vs]
-                print(f"Layer {i} Key shapes: {shapes_k}")
-                print(f"Layer {i} Value shapes: {shapes_v}")
-            
-            try:
-                batched.append((torch.cat(ks,0), torch.cat(vs,0)))
-            except RuntimeError as e:
-                if self.debug:
-                    print(f"Error concatenating at layer {i}: {e}")
-                    print(f"Key tensor shapes: {[k.shape for k in ks]}")
-                    print(f"Value tensor shapes: {[v.shape for v in vs]}")
-                raise  # Re-raise the exception
-                
+            batched.append((torch.cat(ks,0), torch.cat(vs,0)))
         return tuple(batched)
 
     def _build_leftpad_attention_mask(self):
@@ -297,24 +220,15 @@ class StreamManager:
         still_active = []
         for seq in self.active_seqs:
             if seq.is_finished() or self.tokenizer.eos_token_id in seq.generated_tokens:
-                if self.debug:
-                    print(f"Finished sequence: {seq.qid}")
-                    print(f"Final text: {self.tokenizer.decode(seq.generated_tokens, skip_special_tokens=False)}")
+                print(seq.generated_tokens)
+                print(f"Finished sequence: {seq.qid}")
                 # Collect final text
                 text = self.tokenizer.decode(seq.get_final_generation(), skip_special_tokens=True)
-                if not text.strip():  # empty text
-                    print(f"WARNING: Empty completion text for sequence {seq.qid}")
-                    if seq.generated_tokens:
-                        # try all tokens
-                        print(f"Using fallback: all generated tokens for seq {seq.qid}")
-                        text = self.tokenizer.decode(seq.generated_tokens, skip_special_tokens=True)
-                
-                if self.debug:
-                    print(f"Adding completion for prompt '{seq.prompt_text[:30]}...': '{text[:30]}...'")
+                print(f"Final text: {self.tokenizer.decode(seq.generated_tokens, skip_special_tokens=False)}")
                 self.results.setdefault(seq.prompt_text, []).append(text)
                 # Free KV cache and sequence
                 # seq.kv_cache = None
-                if self.spec_decoding and seq.qid in self.ngram_registry:
+                if self.spec_decoding:
                     reg = self.ngram_registry[seq.qid]
                     reg['ref_count'] -= 1
                     if reg['ref_count'] == 0:
@@ -330,31 +244,7 @@ class StreamManager:
         torch.cuda.empty_cache()
 
         self.active_seqs = still_active
-        
-        # First trim KV caches for space efficiency (before adding new sequences)
-        if self.use_kv_cache and self.active_seqs:
-            eff_len = lambda s: s.get_valid_length() + (1 if s.is_finished() else 0)
-            for seq in self.active_seqs:
-                if not seq.kv_cache:
-                    continue
-                L = eff_len(seq)
-                if self.debug:
-                    print(f"Trimming seq {seq.qid} to length {L}, valid_length={seq.get_valid_length()}, finished={seq.is_finished()}")
-                seq.kv_cache = [(k[..., -L:, :], v[..., -L:, :]) for k, v in seq.kv_cache]
-        
-        # Add new sequences
-        needed = self.stream_width - len(self.active_seqs)
-        for _ in range(needed):
-            if not self.prompt_deque:
-                break
-            p, c, qid = self.prompt_deque.popleft()
-            new = self._prefill_prompt(p, 1, qid)
-            self.active_seqs += new
-            if c > 1:
-                self.prompt_deque.append((p, c-1, qid))
-        
-        # Ensure all KV caches are of the same length after adding new sequences
-        self._align_kv_cache_lengths()
+        self._refill_active_seqs()
 
     def _generate_step_with_kv(self, proposals=None):
         """
@@ -535,8 +425,7 @@ class StreamManager:
 
                     # append accepted proposal tokens
                     accepted_ids = ids[mask].tolist()
-                    if self.debug:
-                        print(f"Sequence {i} (qid={seq.qid}): Accepted {len(accepted_ids)} tokens")
+                    print(accepted_ids)
                     for tok in accepted_ids:
                         seq.append_token(int(tok))
 
@@ -554,26 +443,12 @@ class StreamManager:
 
                     # update KV cache
                     if self.use_kv_cache:
-                        if self.debug:
-                            old_shapes = [k.shape for k, _ in seq.kv_cache]
-                            new_shapes = [k.shape for k, _ in per_seq_past[i]]
-                            print(f"Seq {i} (qid={seq.qid}): Old KV key shapes: {old_shapes}")
-                            print(f"Seq {i} (qid={seq.qid}): New KV key shapes: {new_shapes}")
                         seq.kv_cache = per_seq_past[i]
-                    
-                    # Check if sequence is finished
-                    if seq.is_finished():
-                        # Don't add to next_active
-                        if self.debug:
-                            print(f"Sequence {i} (qid={seq.qid}) is finished and removed")
-                        continue
-                    next_active.append(seq)
-                
-                # Update active sequences
-                self.active_seqs = next_active
-                
-                # Now do a single cleanup and refill after all sequences are processed
-                self._cleanup_and_refill()
+
+                    # After updating each seq.kv_cache: TODO fix this
+                    # problem is that if we add different lengths we have different lengths in the KV cache
+                    self._cleanup_and_refill()
+
 
             else:
                 # regular single-token continuous generation
@@ -592,14 +467,11 @@ class StreamManager:
                     if self.use_kv_cache:
                         seq.kv_cache = new_past[i]
                     if seq.is_finished():
-                        txt = self.tokenizer.decode(seq.get_final_generation(), skip_special_tokens=True)
-                        if self.debug:
-                            print(f"Non-spec mode: Adding completion for prompt '{seq.prompt_text[:30]}...': '{txt[:30]}...'")
-                            print(f"Generated tokens: {seq.generated_tokens}")
+                        txt = self.tokenizer.decode(seq.full_input(), skip_special_tokens=True)
                         self.results.setdefault(seq.prompt_text, []).append(txt)
                         self.pbar.update(1)
-                        if self.spec_decoding and seq.qid in self.ngram_registry:
-                            reg = self.ngram_registry[seq.qid]
+                        reg = self.ngram_registry.get(seq.qid)
+                        if reg:
                             reg['ref_count'] -= 1
                             if reg['ref_count'] == 0:
                                 del self.ngram_registry[seq.qid]
@@ -612,50 +484,21 @@ class StreamManager:
 
         # finalize leftovers
         for seq in self.active_seqs:
-            txt = self.tokenizer.decode(seq.get_final_generation(), skip_special_tokens=True)
-            if self.debug:
-                print(f"Finalizing leftover sequence: '{txt[:30]}...'")
-                print(f"Generated tokens: {seq.generated_tokens}")
+            txt = self.tokenizer.decode(seq.full_input(), skip_special_tokens=True)
             self.results.setdefault(seq.prompt_text, []).append(txt)
 
     def run_generation_loop(self):
         self.pbar = tqdm(total=self.len_queue, desc="Generating...")
         if self.continuous_batching: self._run_generation_continuous()
         else: self._run_generation_static()
-        
-        # check results
-        print("\n--- RESULTS CHECK ---")
-        if not self.results:
-            print("ERROR: Results dict empty!")
-        else:
-            print(f"Results has {len(self.results)} prompts")
-            for prompt, completions in self.results.items():
-                print(f"  '{prompt[:30]}...' -> {len(completions)} completions")
-        
         self.save_results("generation_results.json")
         self.pbar.close()
         self.len_queue = 0
 
     def save_results(self, filename):
-        ordered = {}
+        ordered={}
         for p, _ in self.prompt_order:
-            completions = self.results.get(p, [])
-            # add empty string if no completions
-            if not completions:
-                print(f"WARNING: No completions for prompt '{p[:30]}...', adding empty string")
-                completions = [""]
-            ordered[p] = completions
-            
-        with open(filename, 'w') as f:
-            json.dump(ordered, f, indent=2)
+            ordered[p]=self.results.get(p,[])
+        with open(filename,'w') as f:
+            json.dump(ordered,f,indent=2)
         print(f"Results saved to {filename}")
-        
-        # quick verification
-        print(f"Final results contains {len(ordered)} prompts")
-        for prompt, completions in ordered.items():
-            if not completions:
-                print(f"ERROR: Still no completions for '{prompt[:30]}...'")
-            elif all(not c.strip() for c in completions):
-                print(f"WARNING: Only empty completions for '{prompt[:30]}...'")
-            else:
-                print(f"OK: Prompt '{prompt[:30]}...' has {len(completions)} completions")
