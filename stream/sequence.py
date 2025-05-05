@@ -54,25 +54,7 @@ class Sequence:
         Returns the generated tokens that are valid (i.e. tokens with mask 1, excluding dummy tokens).
         """
         # Valid generated tokens = valid tokens minus prompt tokens.
-        valid_length = self.get_valid_length()
-        prompt_length = len(self.prompt_tokens)
-        
-        # Debug information about token lengths
-        print(f"[TOKEN DEBUG] qid={self.qid}, valid_length={valid_length}, prompt_length={prompt_length}")
-        print(f"[TOKEN DEBUG] generated_tokens={self.generated_tokens}, length_mask={self.length_mask}")
-        
-        # No valid tokens? 
-        if valid_length <= prompt_length:
-            print(f"[TOKEN DEBUG] No valid generated tokens (valid_length <= prompt_length)")
-            # Return all tokens as fallback
-            if self.generated_tokens:
-                print(f"[TOKEN DEBUG] Using all generated tokens")
-                return self.generated_tokens
-            return []
-            
-        # Return only valid tokens
-        valid_generated = self.generated_tokens[: (valid_length - prompt_length)]
-        print(f"[TOKEN DEBUG] returning valid_generated={valid_generated}")
+        valid_generated = self.generated_tokens[: (self.get_valid_length() - len(self.prompt_tokens))]
         return valid_generated
 
     def set_prompt_tokens(self, tokens):
