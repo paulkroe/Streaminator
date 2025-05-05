@@ -90,8 +90,7 @@ class StreamManager:
         self.next_qid += 1
 
         # track how many sequences will use this n-gram
-        if self.spec_decoding:
-            self.ngram_registry[qid] = {'model': None, 'ref_count': num_completions}
+        self.ngram_registry[qid] = {'model': None, 'ref_count': num_completions}
 
         self.len_queue += num_completions
         self._debug_print(f"Enqueue prompt: {prompt_text[:60]!r}, num_completions={num_completions}")
@@ -220,19 +219,11 @@ class StreamManager:
         still_active = []
         for seq in self.active_seqs:
             if seq.is_finished() or self.tokenizer.eos_token_id in seq.generated_tokens:
-                print(seq.generated_tokens)
-                print(f"Finished sequence: {seq.qid}")
                 # Collect final text
                 text = self.tokenizer.decode(seq.get_final_generation(), skip_special_tokens=True)
-                print(f"Final text: {self.tokenizer.decode(seq.generated_tokens, skip_special_tokens=False)}")
                 self.results.setdefault(seq.prompt_text, []).append(text)
                 # Free KV cache and sequence
                 # seq.kv_cache = None
-                if self.spec_decoding:
-                    reg = self.ngram_registry[seq.qid]
-                    reg['ref_count'] -= 1
-                    if reg['ref_count'] == 0:
-                        del self.ngram_registry[seq.qid]
                 if self.use_kv_cache:
                     self.prompt_kv_cache.pop(seq.prompt_text, None)
                 del seq
@@ -379,76 +370,88 @@ class StreamManager:
         while self.active_seqs or self.prompt_deque:
             if step % self.refill_period == 0:
                 self._cleanup_and_refill()
-                print("================")
+
             if self.spec_decoding:
                 # 1) Build proposals and collect q-distributions
                 proposals, q_dists = [], []
                 for seq in self.active_seqs:
                     ngram = self.ngram_registry[seq.qid]['model']
-                    ctx = seq.full_input()                # 1D tensor
+                    ctx = seq.full_input()
                     xs, dists = [], []
                     cur = ctx.clone()
                     for _ in range(self.gamma):
-                        dist = ngram(cur)                # [vocab_size]
-                        tok_id = dist.argmax().view(1)
+                        dist = ngram(cur)               # full dist [vocab_size]
+                        tok_id = dist.argmax().view(1)  # argmax proposal
                         xs.append(tok_id)
                         dists.append(dist)
                         cur = torch.cat([cur, tok_id], dim=0)
-                    proposals.append(torch.cat(xs, dim=0))     # [gamma]
-                    q_dists.append(torch.stack(dists, dim=0))  # [gamma, vocab_size]
+                    proposals.append(torch.cat(xs, dim=0))   # [gamma]
+                    q_dists.append(torch.stack(dists, dim=0)) # [gamma, vocab_size]
 
-                # 2) Run LM and split KV caches
-                B = len(self.active_seqs)
+                                                # 2) Query LM and split KV caches
                 if self.use_kv_cache:
-                    p_logits_all, new_past_all = self._generate_step_with_kv(proposals)
+                    p_logits, new_past_all = self._generate_step_with_kv(proposals)
+                    # split batched past into per-sequence caches
                     per_seq_past = []
-                    for seq_idx in range(B):
+                    for idx in range(len(self.active_seqs)):
                         seq_kv = []
-                        for layer_k, layer_v in new_past_all:
-                            seq_kv.append((layer_k[seq_idx:seq_idx+1], layer_v[seq_idx:seq_idx+1]))
+                        for layer in new_past_all:
+                            seq_kv.append((layer[0][idx:idx+1], layer[1][idx:idx+1]))
                         per_seq_past.append(seq_kv)
                 else:
-                    p_logits_all, _ = self._generate_step_without_kv(proposals)
-                    per_seq_past = [None] * B
-
-                # 3) Process each sequence
+                    p_logits, _ = self._generate_step_without_kv(proposals)
+                    per_seq_past = [None] * len(self.active_seqs)
                 next_active = []
                 for i, seq in enumerate(self.active_seqs):
-                    p_probs = torch.softmax(p_logits_all[i], dim=-1)  # [gamma, vocab_size]
-                    ids = proposals[i]                                 # [gamma]
+                    # convert logits to probabilities
+                    p_probs = torch.softmax(p_logits[i], dim=-1)  # [gamma, vocab_size]
+                    ids = proposals[i]  # [gamma]
+
+                    # extract per-step probabilities
                     idx = torch.arange(self.gamma, device=ids.device)
                     p_token_probs = p_probs[idx, ids]
                     q_token_probs = q_dists[i][idx, ids]
 
-                    # acceptance mask
+                    # 3) Compute acceptance mask
                     mask = self._accept_speculative(q_token_probs, p_token_probs)
 
-                    # append accepted proposal tokens
-                    accepted_ids = ids[mask].tolist()
-                    print(accepted_ids)
-                    for tok in accepted_ids:
-                        seq.append_token(int(tok))
-
-                    # determine final index: last accepted, or 0
-                    accepted_idxs = mask.nonzero(as_tuple=False).view(-1)
-                    if accepted_idxs.numel() > 0:
-                        final_idx = accepted_idxs[-1].item()
+                    # 4) Append accepted tokens
+                    accepted = ids[mask].tolist()
+                    seq.generated_tokens.extend(accepted)
+                    # find last accepted index for final sampling
+                    accepted_indices = mask.nonzero(as_tuple=False).view(-1)
+                    if accepted_indices.numel() > 0:
+                        final_idx = accepted_indices[-1].item()
                     else:
                         final_idx = 0
 
-                    # sample final token from LM at final_idx
+                    # 5) Final token from LM at index final_idx
                     final_dist = p_probs[final_idx]
                     t = PromptSampler.sample_token(final_dist)
-                    seq.append_token(int(t))
+                    seq.generated_tokens.append(int(t))
 
-                    # update KV cache
-                    if self.use_kv_cache:
-                        seq.kv_cache = per_seq_past[i]
+                    # update KV cache if used
+                    if self.use_kv_cache and new_past_all is not None:
+                        # split batched past into per-sequence caches
+                        seq_kv = []
+                        for layer_k, layer_v in new_past_all:
+                            # layer_k, layer_v have shape [B, T, ...]
+                            seq_kv.append((layer_k[i:i+1], layer_v[i:i+1]))
+                        seq.kv_cache = seq_kv
 
-                    # After updating each seq.kv_cache: TODO fix this
-                    # problem is that if we add different lengths we have different lengths in the KV cache
-                    self._cleanup_and_refill()
+                    # finalize or keep active
+                    if seq.is_finished():
+                        txt = self.tokenizer.decode(seq.full_input(), skip_special_tokens=True)
+                        self.results.setdefault(seq.prompt_text, []).append(txt)
+                        self.pbar.update(1)
+                        reg = self.ngram_registry[seq.qid]
+                        reg['ref_count'] -= 1
+                        if reg['ref_count'] == 0:
+                            del self.ngram_registry[seq.qid]
+                    else:
+                        next_active.append(seq)
 
+                self.active_seqs = next_active
 
             else:
                 # regular single-token continuous generation
@@ -484,7 +487,7 @@ class StreamManager:
 
         # finalize leftovers
         for seq in self.active_seqs:
-            txt = self.tokenizer.decode(seq.full_input(), skip_special_tokens=True)
+            txt = self.tokenizer.decode(seq.get_full_input(), skip_special_tokens=True)
             self.results.setdefault(seq.prompt_text, []).append(txt)
 
     def run_generation_loop(self):

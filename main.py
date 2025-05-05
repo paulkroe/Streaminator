@@ -17,26 +17,14 @@ import pynvml
 import gc
 
 def main():
-    HUGGINGFACE_TOKEN =
-    # Replace with your token
-    # If using Llama-3.2-1B
-    # make sure you have requested access at
-    # https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct
-
-    if not HUGGINGFACE_TOKEN:
-        raise ValueError("Please set your Hugging Face token in the HUGGINGFACE_TOKEN variable.")
-
     # 1) Load a random sample of GSM8K examples from Hugging Face.
     num_samples = 10
     examples = load_random_gsm8k(num_samples=num_samples, seed=42)
 
     # 2) Load model and tokenizer.
-    model_name = "meta-llama/Llama-3.2-1B-Instruct"
-    tokenizer = AutoTokenizer.from_pretrained(model_name, use_auth_token=HUGGINGFACE_TOKEN)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        use_auth_token=HUGGINGFACE_TOKEN
-    )
+    model_name = "meta-llama/Llama-3.2-1B-Instruct"  # Update to your actual model name
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     model.eval()
@@ -86,7 +74,7 @@ def main():
         Always follow this exact response format:
         1. Put your step-by-step calculation process inside <think> tags, explaining each step clearly.
         2. Provide the final answer in a <boxed> tag, using a clear and simplified format.
-
+        
         Below are two examples. You must never deviate from this format.
         Example 1:
         {{#user}}
@@ -97,7 +85,7 @@ def main():
         2. Double the remaining apples: 14 * 2 = 28
         </think>
         \\boxed{28}
-
+        
         Example 2:
         {{#user}}
         What is the value of (3 + 5) * 2?
@@ -207,7 +195,7 @@ def main():
     with open("evaluation_results.json", "w") as f:
         json.dump(results_for_eval, f, indent=2)
     print("Evaluation results saved to evaluation_results.json")
-
+    
 if __name__ == "__main__":
     main()
     pynvml.nvmlShutdown()
