@@ -1,4 +1,5 @@
 # kv_cache_wrapper.py
+import torch
 
 class KVCacheWrapper:
     def __init__(self, past):
@@ -24,7 +25,6 @@ class KVCacheWrapper:
         """
         # This is a minimal implementation; you may need to adjust it to your needs.
         k_old, v_old = self.past[layer_idx]
-        import torch
         new_k = torch.cat([k_old, new_keys], dim=2)
         new_v = torch.cat([v_old, new_values], dim=2)
         self.past = list(self.past)
@@ -49,6 +49,8 @@ class KVCacheWrapper:
         Otherwise, return past unchanged.
         """
         if hasattr(model.config, "model_type") and model.config.model_type.lower().startswith("llama"):
+            if past is None:
+                return None
             return KVCacheWrapper(past)
         else:
             return past
@@ -61,6 +63,8 @@ class _LlamaKVCacheLayerWrapper:
     [batch, n_heads, seq_len, head_dim] and values similarly.
     """
     def __init__(self, past_layer):
+        if not isinstance(past_layer, tuple) or len(past_layer) != 2:
+            raise ValueError("Each layer's cache should be a tuple of (keys, values).")
         self.key, self.value = past_layer  # Unpack the tuple
 
     def get_seq_length(self):
@@ -73,16 +77,19 @@ class _LlamaKVCacheLayerWrapper:
         This method is expected to be called by the model's self-attention.
         """
         # new_key and new_value are expected to have shape [batch, n_heads, 1, head_dim]
+        if new_key is None or new_value is None:
+            raise ValueError("new_key and new_value cannot be None.")
         self.key = self._cat_along_seq(self.key, new_key)
         self.value = self._cat_along_seq(self.value, new_value)
         return self.key, self.value
 
     def _cat_along_seq(self, tensor, new_tensor):
         # Concatenate along dimension 2 (the sequence dimension)
+        if new_tensor is None:
+            return tensor
         return tensor if new_tensor is None else  self._safe_cat(tensor, new_tensor)
 
     def _safe_cat(self, tensor, new_tensor):
-        import torch
         return torch.cat([tensor, new_tensor], dim=2)
 
     # To support iteration if needed
