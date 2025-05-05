@@ -13,6 +13,7 @@ from .ngram import NGram
 import pynvml
 from tqdm import tqdm
 import gc
+
 pynvml.nvmlInit()
 
 class StreamManager:
@@ -62,6 +63,8 @@ class StreamManager:
 
         # TODO this should be a parameter
         self.gamma = 1
+
+    from .generate_step import _generate_step_with_kv, _generate_step_without_kv, _build_input_ids
 
     def _log_gpu_stats(self, step):
         if not self.logger:
@@ -245,109 +248,14 @@ class StreamManager:
 
         self.active_seqs = still_active
         self._refill_active_seqs()
-
-    def _generate_step_with_kv(self, proposals=None):
-        """
-        Unified KV generation: one-token or gamma-step proposals.
-        """
-        if not self.active_seqs:
-            return None, None
-        B = len(self.active_seqs)
-        # non-speculative
-        if proposals is None:
-            toks, pos, idle = [], [], 0
-            eff_len = lambda s: s.get_valid_length() + (1 if s.is_finished() else 0)
-            for s in self.active_seqs:
-                t = s.next_input_token() or self.tokenizer.eos_token_id
-                if s.is_finished(): idle += 1
-                toks.append(t); pos.append(eff_len(s))
-            if idle == B:
-                return None, None
-            input_ids = torch.tensor(toks, device=self.device).unsqueeze(1)
-            position_ids = torch.tensor(pos, device=self.device).unsqueeze(1)
-            batched = self._get_batched_kv()
-            mask = self._build_leftpad_attention_mask()
-            token_mask = torch.ones(B, 1, device=self.device)
-            mask = torch.cat([mask, token_mask], dim=1)
-            with torch.no_grad():
-                out = self.model(
-                    input_ids=input_ids,
-                    position_ids=position_ids,
-                    past_key_values=KVCacheWrapper.wrap(batched, self.model),
-                    use_cache=True,
-                    attention_mask=mask
-                )
-            logits = out.logits[:, -1]
-            new_past = out.past_key_values
-            per = []
-            for i in range(B):
-                seq_kv = []
-                for layer in new_past:
-                    seq_kv.append((layer[0][i:i+1], layer[1][i:i+1]))
-                per.append(seq_kv)
-            return logits, per
-        # speculative proposals
-        gamma = proposals[0].shape[0]
-        proposal_tensor = torch.stack(proposals, dim=0).to(self.device)
-        batched = self._get_batched_kv()
-        base_mask = self._build_leftpad_attention_mask()
-        token_mask = torch.ones(B, gamma, device=self.device)
-        mask = torch.cat([base_mask, token_mask], dim=1)
-        with torch.no_grad():
-            out = self.model(
-                input_ids=proposal_tensor,
-                past_key_values=KVCacheWrapper.wrap(batched, self.model),
-                use_cache=True,
-                attention_mask=mask
-            )
-        return out.logits, out.past_key_values
-
-    def _generate_step_without_kv(self, proposals=None):
-        """
-        Unified non-KV generation: one-token or proposals.
-        """
-        if not self.active_seqs:
-            return None, None
-        if proposals is None:
-            sequences = []
-            for seq in self.active_seqs:
-                gen = torch.tensor(seq.generated_tokens, device=self.device)
-                sequences.append(torch.cat([seq.prompt_tokens, gen]))
-            padded = pad_sequence(sequences, batch_first=True,
-                                  padding_value=self.tokenizer.eos_token_id).to(self.device)
-            mask = (padded != self.tokenizer.eos_token_id).long().to(self.device)
-            with torch.no_grad():
-                out = self.model(
-                    input_ids=padded,
-                    attention_mask=mask,
-                    use_cache=False
-                )
-            logits = torch.stack([out.logits[i, seq.size(0)-1] for i, seq in enumerate(sequences)])
-            return logits, None
-        # speculative proposals
-        batch_inputs = []
-        for i, seq in enumerate(self.active_seqs):
-            prefix = torch.cat([seq.prompt_tokens, torch.tensor(seq.generated_tokens, device=self.device)])
-            batch_inputs.append(torch.cat([prefix, proposals[i].to(self.device)]))
-        padded = pad_sequence(batch_inputs, batch_first=True,
-                              padding_value=self.tokenizer.eos_token_id).to(self.device)
-        mask = (padded != self.tokenizer.eos_token_id).long().to(self.device)
-        with torch.no_grad():
-            out = self.model(
-                input_ids=padded,
-                attention_mask=mask,
-                use_cache=False
-            )
-        return out.logits, None
-
+ 
     def _run_generation_static(self):
         """
         Static loop supports spec_decoding flag: if True, fall back to continuous speculative,
         else do standard static.
         """
         if self.spec_decoding:
-            # simplest: use continuous speculative loop in static mode
-            return self._run_generation_continuous()
+            Raise NotImplementedError("We need to realign the KV cache anyways when doing speculative decoding. Please use continuous generation directly.")
         # original static
         self._refill_active_seqs()
         step = 0
@@ -385,6 +293,7 @@ class StreamManager:
                 proposals, q_dists = [], []
                 for seq in self.active_seqs:
                     ngram = self.ngram_registry[seq.qid]['model']
+                    # TODO: full_input include padding i think
                     ctx = seq.full_input()                # 1D tensor
                     xs, dists = [], []
                     cur = ctx.clone()
@@ -400,17 +309,10 @@ class StreamManager:
                 # 2) Run LM and split KV caches
                 B = len(self.active_seqs)
                 if self.use_kv_cache:
-                    p_logits_all, new_past_all = self._generate_step_with_kv(proposals)
-                    per_seq_past = []
-                    for seq_idx in range(B):
-                        seq_kv = []
-                        for layer_k, layer_v in new_past_all:
-                            seq_kv.append((layer_k[seq_idx:seq_idx+1], layer_v[seq_idx:seq_idx+1]))
-                        per_seq_past.append(seq_kv)
+                    p_logits_all, per_seq_past = self._generate_step_with_kv(proposals)
                 else:
                     p_logits_all, _ = self._generate_step_without_kv(proposals)
                     per_seq_past = [None] * B
-
                 # 3) Process each sequence
                 next_active = []
                 for i, seq in enumerate(self.active_seqs):
@@ -425,7 +327,6 @@ class StreamManager:
 
                     # append accepted proposal tokens
                     accepted_ids = ids[mask].tolist()
-                    print(accepted_ids)
                     for tok in accepted_ids:
                         seq.append_token(int(tok))
 
@@ -441,15 +342,25 @@ class StreamManager:
                     t = PromptSampler.sample_token(final_dist)
                     seq.append_token(int(t))
 
-                    # update KV cache
                     if self.use_kv_cache:
-                        seq.kv_cache = per_seq_past[i]
+                        num_appended    = len(accepted_ids) + 1
+                        old_kv          = seq.kv_cache                 # List[(k_old, v_old)]
+                        new_kv_slices   = per_seq_past[i]               # List[(k_new, v_new)]
+                        updated_kv      = []
 
-                    # After updating each seq.kv_cache: TODO fix this
-                    # problem is that if we add different lengths we have different lengths in the KV cache
-                    self._cleanup_and_refill()
+                        for (k_old, v_old), (k_new, v_new) in zip(old_kv, new_kv_slices):
+                            # k_new/v_new shape: (1, heads, γ, head_dim)
+                            k_append = k_new[..., :num_appended, :]
+                            v_append = v_new[..., :num_appended, :]
 
-
+                            k_cat = torch.cat([k_old, k_append], dim=2)
+                            v_cat = torch.cat([v_old, v_append], dim=2)
+                            updated_kv.append((k_cat, v_cat))
+                        if mask[0]:
+                            assert seq.kv_cache[0][0].shape[2] + 2 == updated_kv[0][0].shape[2], f"accept: seq.kv_cache[0][0].shape={seq.kv_cache[0][0].shape}, updated_kv[0][0].shape={updated_kv[0][0].shape}"
+                        else:
+                            assert seq.kv_cache[0][0].shape[2] + 1 == updated_kv[0][0].shape[2], f"not accept: seq.kv_cache[0][0].shape={seq.kv_cache[0][0].shape}, updated_kv[0][0].shape={updated_kv[0][0].shape}"
+                        seq.kv_cache = updated_kv
             else:
                 # regular single-token continuous generation
                 logits, new_past = (
