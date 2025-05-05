@@ -49,7 +49,13 @@ class NGram:
                 self.counts[context][nxt] += 1
                 self.context_totals[context] += 1
 
-    def __call__(self, context_tensor):
+        # Precompute probabilities during training
+        self.probabilities = {
+            context: {tok: cnt / self.context_totals[context] for tok, cnt in counts.items()}
+            for context, counts in self.counts.items()
+        }
+
+    def __call__(self, context_tensor, temperature=1.0):
         """
         Given a context tensor of token IDs (1D), return a full probability distribution
         over the vocabulary as a 1D tensor of length vocab_size.
@@ -71,11 +77,13 @@ class NGram:
             else:
                 suffix = None
 
+            discount = 0.75  # Discount factor for Kneser-Ney
             if suffix and suffix in self.counts and self.context_totals[suffix] > 0:
                 total = self.context_totals[suffix]
                 for tok, cnt in self.counts[suffix].items():
                     if 0 <= tok < self.vocab_size:
-                        dist[tok] = cnt / total
+                        dist[tok] = max(cnt - discount, 0) / total
+                        dist[tok] += discount * len(self.counts[suffix]) / total * (self.unigram[tok] / self.total_unigram)
             else:
                 # fallback to unigram
                 if self.total_unigram > 0:
@@ -93,4 +101,9 @@ class NGram:
         else:
             # uniform over vocab if no data
             dist.fill_(1.0 / self.vocab_size)
+
+        # temperature scaling
+        dist = dist ** (1 / temperature)
+        dist = dist / dist.sum()
+
         return dist
