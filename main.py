@@ -17,36 +17,27 @@ import pynvml
 import gc
 
 def main():
-    HUGGINGFACE_TOKEN =
-    # Replace with your token
-    # If using Llama-3.2-1B
-    # make sure you have requested access at
-    # https://huggingface.co/meta-llama/Llama-3.2-1B-Instruct
-
-    if not HUGGINGFACE_TOKEN:
-        raise ValueError("Please set your Hugging Face token in the HUGGINGFACE_TOKEN variable.")
-
     # 1) Load a random sample of GSM8K examples from Hugging Face.
-    num_samples = 32
+    num_samples = 10
     examples = load_random_gsm8k(num_samples=num_samples, seed=42)
 
     # 2) Load model and tokenizer.
     model_name = "meta-llama/Llama-3.2-1B-Instruct"
-    tokenizer = AutoTokenizer.from_pretrained(model_name, use_auth_token=HUGGINGFACE_TOKEN)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
-        use_auth_token=HUGGINGFACE_TOKEN
     )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     model.eval()
 
     # 3) Set up the stream manager with your parameters.
-    stream_width = 16
-    max_length = 250
-    use_kv_cache = True
+    stream_width = 32
+    max_length = 100
+    use_kv_cache =  True
     continuous_batching = True
-    num_completions = 2
+    spec_decoding = False
+    num_completions = 4
 
     wandb.init(
         project="pipeline-profiling",
@@ -59,6 +50,7 @@ def main():
             "num_completions": num_completions,
             "use_kv_cache": use_kv_cache,
             "continuous_batching": continuous_batching,
+            "spec_decoding": spec_decoding,
         }
     )
 
@@ -69,7 +61,9 @@ def main():
         max_length=max_length,
         use_kv_cache=use_kv_cache,
         continuous_batching=continuous_batching,
-        logger=wandb
+        spec_decoding=spec_decoding,
+        logger=wandb,
+        debug=True
     )
 
     print(f"Stream manager initialized: stream_width={stream_width}, max_length={max_length}")

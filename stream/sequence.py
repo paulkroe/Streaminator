@@ -1,4 +1,5 @@
 # sequence.py remains unchanged
+import torch
 class Sequence:
     def __init__(self, prompt_text, max_length, eos_token_id, qid=None):
         self.prompt_text = prompt_text
@@ -17,6 +18,13 @@ class Sequence:
         # length_mask mirrors (prompt_tokens + generated_tokens). 
         # 1 indicates a valid token; 0 indicates a dummy/padding token.
         self.length_mask = []
+
+    def full_input(self) -> torch.LongTensor:
+        """
+        Returns concatenated prompt_tokens + generated_tokens as a 1D LongTensor.
+        """
+        gen = torch.tensor(self.generated_tokens, dtype=torch.long, device=self.prompt_tokens.device)
+        return torch.cat([self.prompt_tokens, gen], dim=0)
 
     def is_finished(self):
         return self.finished_pos is not None or len(self.generated_tokens) >= self.max_length
@@ -46,7 +54,25 @@ class Sequence:
         Returns the generated tokens that are valid (i.e. tokens with mask 1, excluding dummy tokens).
         """
         # Valid generated tokens = valid tokens minus prompt tokens.
-        valid_generated = self.generated_tokens[: (self.get_valid_length() - len(self.prompt_tokens))]
+        valid_length = self.get_valid_length()
+        prompt_length = len(self.prompt_tokens)
+        
+        # Debug information about token lengths
+        print(f"[TOKEN DEBUG] qid={self.qid}, valid_length={valid_length}, prompt_length={prompt_length}")
+        print(f"[TOKEN DEBUG] generated_tokens={self.generated_tokens}, length_mask={self.length_mask}")
+        
+        # No valid tokens? 
+        if valid_length <= prompt_length:
+            print(f"[TOKEN DEBUG] No valid generated tokens (valid_length <= prompt_length)")
+            # Return all tokens as fallback
+            if self.generated_tokens:
+                print(f"[TOKEN DEBUG] Using all generated tokens")
+                return self.generated_tokens
+            return []
+            
+        # Return only valid tokens
+        valid_generated = self.generated_tokens[: (valid_length - prompt_length)]
+        print(f"[TOKEN DEBUG] returning valid_generated={valid_generated}")
         return valid_generated
 
     def set_prompt_tokens(self, tokens):
