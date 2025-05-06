@@ -332,6 +332,7 @@ class StreamManager:
                     per_seq_past = [None] * B
                 # 3) Process each sequence
                 for i, seq in enumerate(self.active_seqs):
+                    print("*******************************************")
                     p_probs = torch.softmax(p_logits_all[i], dim=-1)  # [gamma, vocab_size]
                     ids = proposals[i]                                 # [gamma]
                     idx = torch.arange(self.gamma, device=ids.device)
@@ -345,58 +346,43 @@ class StreamManager:
                     accepted_ids = ids[mask].tolist()
                     for tok in accepted_ids:
                         seq.append_token(int(tok))
+                        print("ACCEPTED")
+                        print(f"seq: {i}, Accepted token: {tok}, {self.tokenizer.decode([tok])}")
 
-                    # determine final index: last accepted, or 0
-                    accepted_idxs = mask.nonzero(as_tuple=False).view(-1)
-                    if accepted_idxs.numel() > 0:
-                        final_idx = accepted_idxs[-1].item()
+                    n = int(mask.sum().item())   # 0 <= n <= γ
+
+                    print(f"seq: {i}, n={n}, mask={mask.tolist()}")
+
+                    # 2) build the “difference” distribution at the (n+1)-th position
+                    base = p_probs[n]           # full-model softmax at position n
+                    draft = q_dists[i][n]       # draft-model softmax at same position
+                    diff = (base - draft).clamp(min=0.0)
+
+                    total = diff.sum().item()
+                    if total > 0:
+                        final_dist = diff / total
                     else:
-                        final_idx = 0
+                        final_dist = base      # fallback if all mass was zeroed
 
-                    # sample final token from LM at final_idx
-                    final_dist = (p_probs[final_idx] - q_dists[i][final_idx]).clamp(min=0.0)
-                    total = final_dist.sum()
-                    
-                    if total.item() > 0:
-                        # renormalize to sum to 1
-                        final_dist = final_dist / total
-                    else:
-                        # fall back in the degenerate case
-                        final_dist = p_probs[final_idx]
-
+                    # 3) sample that final token
                     t = PromptSampler.sample_token(final_dist)
                     seq.append_token(int(t))
 
-                    if self.use_kv_cache:
-                        old_kv        = seq.kv_cache               # List of (k_old, v_old)
-                        new_kv_slices = per_seq_past[i]             # List of (k_new_all, v_new_all)
-                        updated_kv    = []
+                    print(f"seq: {i}, Final token: {t}, {self.tokenizer.decode([t])}")
 
-                        # mask: Boolean tensor of shape [γ], true where proposal was accepted
-                        accepted_idxs = mask.nonzero(as_tuple=False).view(-1)  # e.g. tensor([0, 2, ...])
-                        # final_idx was computed above: the index in [0..γ-1] from which we sampled
-                        # Build a Python list of all positions to append: accepted proposals + the final token
-                        indices = accepted_idxs.tolist() + [final_idx]
-
-                        for (k_old, v_old), (k_new_all, v_new_all) in zip(old_kv, new_kv_slices):
-                            # k_new_all/v_new_all have shape (1, heads, γ, head_dim)
-                            # gather exactly those slices
-                            k_append = k_new_all[..., indices, :]  # (1, heads, len(indices), head_dim)
-                            v_append = v_new_all[..., indices, :]
-
-                            # concatenate onto the old cache along the sequence dim (dim=2)
-                            k_cat = torch.cat([k_old, k_append], dim=2)
-                            v_cat = torch.cat([v_old, v_append], dim=2)
-                            updated_kv.append((k_cat, v_cat))
-
-                        # sanity-check: cache should grow by len(indices)
-                        prev_len = seq.kv_cache[0][0].shape[2]
-                        new_len  = updated_kv[0][0].shape[2]
-                        assert new_len - prev_len == len(indices), (
-                            f"KV grew by {new_len - prev_len} but expected {len(indices)}"
-                        )
-
-                        seq.kv_cache = updated_kv
+                    # 4) for KV you append exactly those n draft tokens + the 1 correction:
+                    indices = list(range(n)) + [n]
+                    old_kv        = seq.kv_cache
+                    new_kv_slices = per_seq_past[i]
+                    updated_kv    = []
+                    for (k_old, v_old), (k_new_all, v_new_all) in zip(old_kv, new_kv_slices):
+                        k_append = k_new_all[..., indices, :]
+                        v_append = v_new_all[..., indices, :]
+                        updated_kv.append((
+                        torch.cat([k_old, k_append], dim=2),
+                        torch.cat([v_old, v_append], dim=2)
+                        ))
+                    seq.kv_cache = updated_kv
             else:
                 # regular single‐token continuous generation
                 logits, new_past = (

@@ -67,7 +67,7 @@ def _generate_step_without_kv(self, proposals=None):
     else:
         # speculative γ-step case → return the last γ logits
         gamma = proposals[0].shape[0]
-        logits = out.logits[:, -gamma:, :]
+        logits = out.logits[:, -(gamma + 1):, :]
 
     return logits, None
 
@@ -149,13 +149,12 @@ def _generate_step_with_kv(self, proposals=None):
     if proposals is None:
         # (B, 1, V) → (B, V)
         logits = out.logits[:, -1, :]
+        new_len = 1
     else:
         # (B, 1+γ, V) → keep only the speculative portion → (B, γ, V)
-        logits = out.logits[:, -gamma:, :]
-
-    # determine how many new tokens were just appended
-    new_len = 1 if proposals is None else gamma
-
+        logits = out.logits[:, -(gamma + 1):, :]
+        new_len = gamma + 1
+    
     # 5) unpack only the KV for those new tokens
     new_per_seq_kv = []
     for i in range(B):
