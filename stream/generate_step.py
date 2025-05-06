@@ -15,30 +15,61 @@ import gc
 
 def _generate_step_without_kv(self, proposals=None):
     """
-    Unified non-KV generation: one-token or proposals.
+    Unified non-KV generation: single-step (proposals=None) or γ-step speculative.
+    Returns:
+        logits: Tensor of shape (B, vocab) if proposals is None,
+                or (B, γ, vocab) if proposals is provided.
     """
     if not self.active_seqs:
         return None, None
+
+    # 1) Build input sequences: prompt + generated_tokens [+ proposals]
+    sequences = []
+    for i, seq in enumerate(self.active_seqs):
+        # bring prompt_tokens onto the right device
+        prompt = seq.prompt_tokens.to(self.device)
+        # collected past outputs
+        gen = torch.tensor(seq.generated_tokens, device=self.device) \
+              if getattr(seq, 'generated_tokens', None) else torch.empty(0, dtype=torch.long, device=self.device)
+
+        seq_tokens = torch.cat([prompt, gen], dim=0)
+
+        if proposals is not None:
+            # proposals[i] should be a 1D tensor of length γ
+            prop = proposals[i].to(self.device)
+            seq_tokens = torch.cat([seq_tokens, prop], dim=0)
+
+        sequences.append(seq_tokens)
+
+    # 2) Pad to batch and build attention mask
+    padded = pad_sequence(
+        sequences,
+        batch_first=True,
+        padding_value=self.tokenizer.eos_token_id
+    ).to(self.device)
+    mask = (padded != self.tokenizer.eos_token_id).long().to(self.device)
+
+    # 3) Forward pass (no KV)
+    with torch.no_grad():
+        out = self.model(
+            input_ids=padded,
+            attention_mask=mask,
+            use_cache=False
+        )
+
+    # 4) Slice out the logits we need
     if proposals is None:
-        sequences = []
-        for seq in self.active_seqs:
-            gen = torch.tensor(seq.generated_tokens, device=self.device)
-            sequences.append(torch.cat([seq.prompt_tokens, gen]))
-        padded = pad_sequence(sequences, batch_first=True,
-                                padding_value=self.tokenizer.eos_token_id).to(self.device)
-        mask = (padded != self.tokenizer.eos_token_id).long().to(self.device)
-        with torch.no_grad():
-            out = self.model(
-                input_ids=padded,
-                attention_mask=mask,
-                use_cache=False
-            )
-        logits = torch.stack([out.logits[i, seq.size(0)-1] for i, seq in enumerate(sequences)])
-        return logits, None
-    # speculative proposals
+        # single-token case → gather the logit at each sequence’s last real position
+        logits = torch.stack([
+            out.logits[i, seq.size(0) - 1]
+            for i, seq in enumerate(sequences)
+        ], dim=0)
     else:
-        assert 0
-        return out.logits, None
+        # speculative γ-step case → return the last γ logits
+        gamma = proposals[0].shape[0]
+        logits = out.logits[:, -gamma:, :]
+
+    return logits, None
 
 def _build_input_ids(self, proposals=None):
     B = len(self.active_seqs)
@@ -52,7 +83,7 @@ def _build_input_ids(self, proposals=None):
         toks.append(t)
         pos.append(eff_len(s))
     if idle == B:
-        return None, None, None  # nothing to do
+        return None, None, True
 
     # shape (B,1)
     input_ids = torch.tensor(toks, device=self.device).unsqueeze(1)
@@ -70,7 +101,7 @@ def _build_input_ids(self, proposals=None):
         proposal_pos = position_ids + offsets  # (B,γ)
         position_ids = torch.cat([position_ids, proposal_pos], dim=1)
 
-    return input_ids, position_ids, idle == B
+    return input_ids, position_ids, False
 
 def _generate_step_with_kv(self, proposals=None):
     """

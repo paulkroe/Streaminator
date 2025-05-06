@@ -128,7 +128,7 @@ class StreamManager:
         seq.set_prompt_tokens(prompt_tokens.clone())
 
         # Lazy-create the n-gram model if needed
-        if self.ngram_registry[qid]['model'] is None:
+        if self.spec_decoding and self.ngram_registry[qid]['model'] is None:
             self.ngram_registry[qid]['model'] = NGram(self.tokenizer, self.n_ngram)
             self.ngram_registry[qid]['model'].train([prompt_text])
 
@@ -184,7 +184,6 @@ class StreamManager:
                     ) for k,v in seq.kv_cache]
 
     def _get_batched_kv(self):
-        # print("_get_batched_kv")
         if not self.active_seqs:
             return None
         layers = len(self.active_seqs[0].kv_cache)
@@ -193,8 +192,6 @@ class StreamManager:
             ks = [s.kv_cache[i][0] for s in self.active_seqs]
             vs = [s.kv_cache[i][1] for s in self.active_seqs]
             batched.append((torch.cat(ks,0), torch.cat(vs,0)))
-        # print([s.kv_cache[0][0].shape[-2] for s in self.active_seqs])
-        # print([s.kv_cache[0][1].shape[-2] for s in self.active_seqs])
         return tuple(batched)
 
     def _build_leftpad_attention_mask(self):
@@ -255,28 +252,50 @@ class StreamManager:
         else do standard static.
         """
         if self.spec_decoding:
-            raise NotImplementedError("We need to realign the KV cache anyways when doing speculative decoding. Please use continuous generation directly.")
+            raise NotImplementedError(
+                "We need to realign the KV cache anyways when doing speculative decoding. "
+                "Please use continuous generation directly."
+            )
+
         # original static
         self._refill_active_seqs()
         step = 0
+
         while self.active_seqs or self.prompt_deque:
             if step % self.refill_period == 0:
                 self._cleanup_and_refill()
-            logits, new_past = (self._generate_step_with_kv() if self.use_kv_cache
-                                 else self._generate_step_without_kv())
+
+            logits, new_past = (
+                self._generate_step_with_kv() if self.use_kv_cache
+                else self._generate_step_without_kv()
+            )
+
             if logits is None:
                 step += 1
                 continue
+
             for i, seq in enumerate(self.active_seqs):
+                # 1) sample and append the token
                 tok = PromptSampler.sample_token(logits[i])
-                seq.append_token(tok)
+                seq.append_token(int(tok))
+
+                # 2) if using KV, append the new slice rather than replace
                 if self.use_kv_cache and new_past is not None:
-                    seq.kv_cache = new_past[i]
+                    old_kv        = seq.kv_cache         # List[(k_old, v_old)]
+                    new_kv_slices = new_past[i]          # List[(k_new, v_new)]
+                    updated_kv    = []
+
+                    for (k_old, v_old), (k_new, v_new) in zip(old_kv, new_kv_slices):
+                        # k_new/v_new have shape (1, heads, 1, head_dim)
+                        k_cat = torch.cat([k_old, k_new], dim=2)
+                        v_cat = torch.cat([v_old, v_new], dim=2)
+                        updated_kv.append((k_cat, v_cat))
+
+                    seq.kv_cache = updated_kv
+
             step += 1
             self._log_gpu_stats(step)
-        for seq in self.active_seqs:
-            txt = self.tokenizer.decode(seq.get_final_generation(), skip_special_tokens=True)
-            self.results.setdefault(seq.prompt_text, []).append(txt)
+
 
     def _run_generation_continuous(self):
         """
@@ -286,7 +305,6 @@ class StreamManager:
         step = 0
         while self.active_seqs or self.prompt_deque:
             self._cleanup_and_refill()
-            # print("================")
             if self.spec_decoding:
                 # 1) Build proposals and collect q-distributions
                 proposals, q_dists = [], []
@@ -313,7 +331,6 @@ class StreamManager:
                     p_logits_all, _ = self._generate_step_without_kv(proposals)
                     per_seq_past = [None] * B
                 # 3) Process each sequence
-                next_active = []
                 for i, seq in enumerate(self.active_seqs):
                     p_probs = torch.softmax(p_logits_all[i], dim=-1)  # [gamma, vocab_size]
                     ids = proposals[i]                                 # [gamma]
@@ -323,9 +340,7 @@ class StreamManager:
 
                     # acceptance mask
                     mask = self._accept_speculative(q_token_probs, p_token_probs)
-                    # if mask[0]:
-                    #    print(q_token_probs, p_token_probs)
-
+                    
                     # append accepted proposal tokens
                     accepted_ids = ids[mask].tolist()
                     for tok in accepted_ids:
@@ -339,7 +354,16 @@ class StreamManager:
                         final_idx = 0
 
                     # sample final token from LM at final_idx
-                    final_dist = p_probs[final_idx]
+                    final_dist = (p_probs[final_idx] - q_dists[i][final_idx]).clamp(min=0.0)
+                    total = final_dist.sum()
+                    
+                    if total.item() > 0:
+                        # renormalize to sum to 1
+                        final_dist = final_dist / total
+                    else:
+                        # fall back in the degenerate case
+                        final_dist = p_probs[final_idx]
+
                     t = PromptSampler.sample_token(final_dist)
                     seq.append_token(int(t))
 
@@ -373,12 +397,8 @@ class StreamManager:
                         )
 
                         seq.kv_cache = updated_kv
-
-            # for s in self.active_seqs:
-            #     print(s.kv_cache[0][0].shape[-2])
-            # print("++++++++++++")
-            if False:
-                # regular single-token continuous generation
+            else:
+                # regular single‐token continuous generation
                 logits, new_past = (
                     self._generate_step_with_kv() if self.use_kv_cache
                     else self._generate_step_without_kv()
@@ -387,32 +407,25 @@ class StreamManager:
                     step += 1
                     continue
 
-                next_active = []
                 for i, seq in enumerate(self.active_seqs):
+                    # 1) sample one token
                     tok = PromptSampler.sample_token(logits[i])
-                    seq.append_token(tok)
+                    seq.append_token(int(tok))
+
+                    # 2) update KV‐cache by appending exactly the new slice
                     if self.use_kv_cache:
-                        seq.kv_cache = new_past[i]
-                    if seq.is_finished():
-                        txt = self.tokenizer.decode(seq.full_input(), skip_special_tokens=True)
-                        self.results.setdefault(seq.prompt_text, []).append(txt)
-                        self.pbar.update(1)
-                        reg = self.ngram_registry.get(seq.qid)
-                        if reg:
-                            reg['ref_count'] -= 1
-                            if reg['ref_count'] == 0:
-                                del self.ngram_registry[seq.qid]
-                    else:
-                        next_active.append(seq)
-                self.active_seqs = next_active
+                        old_kv        = seq.kv_cache             # List[(k_old, v_old)]
+                        new_kv_slices = new_past[i]              # List[(k_new, v_new)]
+                        updated_kv    = []
 
-            step += 1
-            self._log_gpu_stats(step)
+                        for (k_old, v_old), (k_new, v_new) in zip(old_kv, new_kv_slices):
+                            # here k_new/v_new have shape (1, heads, 1, head_dim)
+                            # just take that “1” step and concat
+                            k_cat = torch.cat([k_old, k_new], dim=2)
+                            v_cat = torch.cat([v_old, v_new], dim=2)
+                            updated_kv.append((k_cat, v_cat))
 
-        # finalize leftovers
-        for seq in self.active_seqs:
-            txt = self.tokenizer.decode(seq.full_input(), skip_special_tokens=True)
-            self.results.setdefault(seq.prompt_text, []).append(txt)
+                        seq.kv_cache = updated_kv
 
     def run_generation_loop(self):
         self.pbar = tqdm(total=self.len_queue, desc="Generating...")
