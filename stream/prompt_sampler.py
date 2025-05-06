@@ -4,11 +4,14 @@ import torch
 
 class PromptSampler:
     @staticmethod
-    def sample_token(logits, temperature=1.0, top_k=1, top_p=0.95):
+    def sample_token(logits, temperature=1.0, top_k=1, top_p=0.95, is_dist=False):
         # logits: torch.Tensor of shape [vocab_size]
-        if temperature != 1.0:
-            logits = logits / temperature
-        probs = torch.softmax(logits, dim=-1)
+        if not is_dist:
+            if temperature != 1.0:
+                logits = logits / temperature
+            probs = torch.softmax(logits, dim=-1)
+        else :
+            probs = logits
         
         # Apply top-p (nucleus) sampling filtering.
         if top_p is not None:

@@ -15,58 +15,70 @@ import gc
 
 def _generate_step_without_kv(self, proposals=None):
     """
-    Unified non-KV generation: single-step (proposals=None) or γ-step speculative.
+    Unified non-KV generation: single-step (proposals=None or [])
+    or gamma-step speculative.
     Returns:
-        logits: Tensor of shape (B, vocab) if proposals is None,
-                or (B, γ, vocab) if proposals is provided.
+        logits: Tensor of shape (B, vocab) if no proposals,
+                or (B, gamma+1, vocab) if proposals are provided.
     """
     if not self.active_seqs:
         return None, None
 
-    # 1) Build input sequences: prompt + generated_tokens [+ proposals]
+    # 1) Build raw sequences: [prompt + generated_tokens (+ proposals)]
     sequences = []
     for i, seq in enumerate(self.active_seqs):
-        # bring prompt_tokens onto the right device
         prompt = seq.prompt_tokens.to(self.device)
-        # collected past outputs
-        gen = torch.tensor(seq.generated_tokens, device=self.device) \
-              if getattr(seq, 'generated_tokens', None) else torch.empty(0, dtype=torch.long, device=self.device)
+        gen = (
+            torch.tensor(seq.generated_tokens, device=self.device)
+            if getattr(seq, "generated_tokens", None)
+            else torch.empty(0, dtype=torch.long, device=self.device)
+        )
+        tokens = torch.cat([prompt, gen], dim=0)
 
-        seq_tokens = torch.cat([prompt, gen], dim=0)
+        if proposals:  # only if the list is non-empty
+            prop = proposals[i].to(self.device)  # (gamma,)
+            tokens = torch.cat([tokens, prop], dim=0)
 
-        if proposals is not None:
-            # proposals[i] should be a 1D tensor of length γ
-            prop = proposals[i].to(self.device)
-            seq_tokens = torch.cat([seq_tokens, prop], dim=0)
+        sequences.append(tokens)
 
-        sequences.append(seq_tokens)
+    # 2) Left-pad every sequence so they all share the same max_len
+    pad_id = self.tokenizer.eos_token_id
+    max_len = max(seq.shape[0] for seq in sequences)
 
-    # 2) Pad to batch and build attention mask
-    padded = pad_sequence(
-        sequences,
-        batch_first=True,
-        padding_value=self.tokenizer.eos_token_id
-    ).to(self.device)
-    mask = (padded != self.tokenizer.eos_token_id).long().to(self.device)
+    padded_seqs = []
+    masks       = []
+    for seq in sequences:
+        pad_len = max_len - seq.shape[0]
+        # left-pad with pad_id
+        left_pad   = torch.full((pad_len,), pad_id, device=self.device, dtype=torch.long)
+        padded     = torch.cat([left_pad, seq], dim=0)
+        # mask: 0 for pad, 1 for real
+        m = torch.cat([
+            torch.zeros(pad_len, device=self.device, dtype=torch.long),
+            torch.ones(seq.shape[0], device=self.device, dtype=torch.long)
+        ], dim=0)
 
-    # 3) Forward pass (no KV)
+        padded_seqs.append(padded)
+        masks.append(m)
+
+    input_ids      = torch.stack(padded_seqs, dim=0)  # (B, max_len)
+    attention_mask = torch.stack(masks, dim=0)        # (B, max_len)
+
+    # 3) Forward
     with torch.no_grad():
         out = self.model(
-            input_ids=padded,
-            attention_mask=mask,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
             use_cache=False
         )
 
-    # 4) Slice out the logits we need
-    if proposals is None:
-        # single-token case → gather the logit at each sequence’s last real position
-        logits = torch.stack([
-            out.logits[i, seq.size(0) - 1]
-            for i, seq in enumerate(sequences)
-        ], dim=0)
+    # 4) Slice off the logits
+    if not proposals:
+        # single-step → last position
+        logits = out.logits[:, -1, :]              # (B, V)
     else:
-        # speculative γ-step case → return the last γ logits
-        gamma = proposals[0].shape[0]
+        gamma  = proposals[0].shape[0]
+        # keep the last (gamma+1) positions → (B, gamma+1, V)
         logits = out.logits[:, -(gamma + 1):, :]
 
     return logits, None

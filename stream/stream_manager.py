@@ -205,19 +205,46 @@ class StreamManager:
             mask[i, T-v:]=1
         return mask.long()
 
-    def _accept_speculative(self, q_logits: torch.Tensor, p_logits: torch.Tensor) -> torch.BoolTensor:
-        '''
-        Given q_i(x) and p_i(x) for i in [1..gamma],
-        returns a boolean mask of length gamma indicating which speculative tokens to accept contiguously.
-        '''
-        assert q_logits.shape == p_logits.shape
-        r = torch.rand_like(q_logits)
-        accept = r < (p_logits / q_logits)
-        # enforce contiguous acceptance: stop at first False
-        if not accept.all():
-            first_false = (~accept).nonzero()[0].item()
-            accept[first_false:] = False
+    def _accept_speculative(
+        self,
+        q_probs: torch.Tensor,    # shape: (γ,)
+        p_probs: torch.Tensor     # shape: (γ,) or (γ+1,)
+    ) -> torch.BoolTensor:
+        """
+        Given draft-model probabilities q_i and full-model probabilities p_i for
+        i=1..γ, return a boolean mask of length γ indicating which proposed tokens
+        to accept contiguously.
+
+        q_probs.shape = (γ,)
+        p_probs.shape = (γ,)  or  (γ+1,)
+        """
+        # both must be 1D
+        assert q_probs.ndim == 1 and p_probs.ndim == 1
+
+        gamma = q_probs.size(0)
+
+        # if p_probs has one extra entry (the correction step), drop it
+        if p_probs.size(0) == gamma + 1:
+            p_slice = p_probs[:gamma]
+        else:
+            # must match exactly γ
+            assert p_probs.size(0) == gamma, f"p_probs must be length γ or γ+1, got {p_probs.size(0)}"
+            p_slice = p_probs
+
+        # draw uniforms
+        r = torch.rand_like(q_probs)
+
+        # accept_i ~ Bernoulli(p_i / q_i)
+        accept = r < (p_slice / q_probs)
+
+        # enforce contiguous acceptance
+        first_false = (~accept).nonzero(as_tuple=False)
+        if first_false.numel() > 0:
+            idx = first_false[0].item()
+            accept[idx:] = False
+
         return accept
+
 
     def _cleanup_and_refill(self):
         still_active = []
@@ -332,57 +359,63 @@ class StreamManager:
                     per_seq_past = [None] * B
                 # 3) Process each sequence
                 for i, seq in enumerate(self.active_seqs):
-                    print("*******************************************")
-                    p_probs = torch.softmax(p_logits_all[i], dim=-1)  # [gamma, vocab_size]
-                    ids = proposals[i]                                 # [gamma]
-                    idx = torch.arange(self.gamma, device=ids.device)
-                    p_token_probs = p_probs[idx, ids]
-                    q_token_probs = q_dists[i][idx, ids]
+                    # print("*******************************************")
 
-                    # acceptance mask
-                    mask = self._accept_speculative(q_token_probs, p_token_probs)
-                    
-                    # append accepted proposal tokens
+                    # get the full (1+γ)-step block of LM probabilities
+                    p_block = torch.softmax(p_logits_all[i], dim=-1)  # shape: (1+γ, vocab_size)
+                    ids     = proposals[i]                            # shape: (γ,)
+                    gamma   = ids.shape[0]
+                    idx     = torch.arange(gamma, device=ids.device)
+
+                    # acceptance test on the γ draft tokens
+                    p_token_probs = p_block[:gamma, ids]              # p₁…p_γ vs. q₁…q_γ
+                    q_token_probs = q_dists[i][idx, ids]
+                    mask = self._accept_speculative(q_token_probs, p_token_probs.squeeze(1))
+
+                    # count accepted proposals and append them
+                    n = int(mask.sum().item())                        # number of accepted proposals
                     accepted_ids = ids[mask].tolist()
                     for tok in accepted_ids:
                         seq.append_token(int(tok))
-                        print("ACCEPTED")
-                        print(f"seq: {i}, Accepted token: {tok}, {self.tokenizer.decode([tok])}")
+                    #     print("ACCEPTED")
+                    #     print(f"seq: {i}, Accepted token: {tok}, {self.tokenizer.decode([tok])}")
 
-                    n = int(mask.sum().item())   # 0 <= n <= γ
+                    # print(f"seq: {i}, n={n}, mask={mask.tolist()}")
 
-                    print(f"seq: {i}, n={n}, mask={mask.tolist()}")
-
-                    # 2) build the “difference” distribution at the (n+1)-th position
-                    base = p_probs[n]           # full-model softmax at position n
-                    draft = q_dists[i][n]       # draft-model softmax at same position
-                    diff = (base - draft).clamp(min=0.0)
-
-                    total = diff.sum().item()
-                    if total > 0:
-                        final_dist = diff / total
+                    # sample the correction from p_{n+1}, or from the difference if n < γ
+                    base = p_block[n]                                 # this is p_{n+1}
+                    if n < gamma:
+                        draft = q_dists[i][n]                         # q_{n+1}
+                        diff  = (base - draft).clamp(min=0.0)
+                        if (diff.sum().item() > 0) and False:
+                            final_dist = diff / diff.sum()
+                        else:
+                            final_dist = base
                     else:
-                        final_dist = base      # fallback if all mass was zeroed
-
-                    # 3) sample that final token
-                    t = PromptSampler.sample_token(final_dist)
+                        # all γ were accepted → sample from p_{γ+1} directly
+                        final_dist = base
+                    # print(final_dist[:100])
+                    max_token = final_dist.argmax()
+                    # print(f"seq: {i}, max token: {max_token}, {self.tokenizer.decode([max_token])}")
+                    t = PromptSampler.sample_token(final_dist, is_dist=True) # TODO: not using temperature
                     seq.append_token(int(t))
+                    # print(f"seq: {i}, Final token: {t}, {self.tokenizer.decode([t])}")
+                    # assert 0
 
-                    print(f"seq: {i}, Final token: {t}, {self.tokenizer.decode([t])}")
-
-                    # 4) for KV you append exactly those n draft tokens + the 1 correction:
-                    indices = list(range(n)) + [n]
-                    old_kv        = seq.kv_cache
-                    new_kv_slices = per_seq_past[i]
-                    updated_kv    = []
-                    for (k_old, v_old), (k_new_all, v_new_all) in zip(old_kv, new_kv_slices):
-                        k_append = k_new_all[..., indices, :]
-                        v_append = v_new_all[..., indices, :]
-                        updated_kv.append((
-                        torch.cat([k_old, k_append], dim=2),
-                        torch.cat([v_old, v_append], dim=2)
-                        ))
-                    seq.kv_cache = updated_kv
+                    # 4) update KV-cache: append exactly n draft frames + the 1 correction frame
+                    if self.use_kv_cache:
+                        indices = list(range(n)) + [n]
+                        old_kv        = seq.kv_cache
+                        new_kv_slices = per_seq_past[i]
+                        updated_kv    = []
+                        for (k_old, v_old), (k_new_all, v_new_all) in zip(old_kv, new_kv_slices):
+                            k_append = k_new_all[..., indices, :]
+                            v_append = v_new_all[..., indices, :]
+                            updated_kv.append((
+                                torch.cat([k_old, k_append], dim=2),
+                                torch.cat([v_old, v_append], dim=2)
+                            ))
+                        seq.kv_cache = updated_kv
             else:
                 # regular single‐token continuous generation
                 logits, new_past = (
