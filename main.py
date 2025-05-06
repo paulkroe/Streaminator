@@ -129,7 +129,8 @@ def main():
     stream_manager.run_generation_loop()
     end = time.time()
     print(f"Generation took {end - start:.2f} seconds.")
-    wandb.log({"total_generation_time_sec": end - start})
+    if args.use_wandb:
+        wandb.log({"total_generation_time_sec": end - start})
 
     # Count total number of generated tokens (excluding prompt)
     total_generated_tokens = sum(
@@ -141,7 +142,8 @@ def main():
     tokens_per_sec = total_generated_tokens / (end - start)
     print(f"Total generated tokens: {total_generated_tokens}")
     print(f"Tokens per second: {tokens_per_sec:.2f}")
-    wandb.log({"total_generated_tokens": total_generated_tokens, "tokens_per_second": tokens_per_sec})
+    if args.use_wandb:  
+        wandb.log({"total_generated_tokens": total_generated_tokens, "tokens_per_second": tokens_per_sec})
 
     # 8) Convert StreamManager results into a structure for answer-checking.
     results_for_eval = {
@@ -183,11 +185,12 @@ def main():
     print(f"Overall match@n rate:    {overall_match_n:.3f}")
     print(f"Correct generations:     {overall_correct_fraction:.3f} of all completions")
 
-    wandb.log({
-        "overall_pass@n_rate": overall_pass_n,
-        "overall_match@n_rate": overall_match_n,
-        "overall_correct_fraction": overall_correct_fraction
-    })
+    if args.use_wandb:
+        wandb.log({
+            "overall_pass@n_rate": overall_pass_n,
+            "overall_match@n_rate": overall_match_n,
+            "overall_correct_fraction": overall_correct_fraction
+        })
 
     # 11) Compute and log average completion length
     all_completion_lengths = [
@@ -200,7 +203,8 @@ def main():
         if all_completion_lengths else 0.0
     )
     print(f"Average completion length (in tokens): {avg_completion_length:.2f}")
-    wandb.log({"avg_completion_length_tokens": avg_completion_length})
+    if args.use_wandb:
+        wandb.log({"avg_completion_length_tokens": avg_completion_length})
 
     with open("evaluation_results.json", "w") as f:
         json.dump(results_for_eval, f, indent=2)
