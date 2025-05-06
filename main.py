@@ -7,6 +7,7 @@ import random
 import torch
 import textwrap
 import wandb
+import argparse
 from string import Template
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -16,52 +17,64 @@ from data import load_random_gsm8k
 import pynvml
 import gc
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Generate and evaluate math problem solutions")
+    parser.add_argument("--num_samples", type=int, default=32, help="Number of GSM8K examples to sample")
+    parser.add_argument("--model_name", type=str, default="meta-llama/Llama-3.2-1B-Instruct", 
+                       help="Name of the LLM model to use")
+    parser.add_argument("--stream_width", type=int, default=16, help="Stream width for generation")
+    parser.add_argument("--max_length", type=int, default=250, help="Maximum length for generation")
+    parser.add_argument("--num_completions", type=int, default=2, help="Number of completions to generate")
+    parser.add_argument("--use_kv_cache", action="store_true", default=True, help="Whether to use KV cache")
+    parser.add_argument("--continuous_batching", action="store_true", default=True, help="Whether to use continuous batching")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--use_wandb", action="store_true", default=False, help="Whether to use wandb")
+    return parser.parse_args()
+
 def main():
+    # Parse command line arguments
+    args = parse_args()
+    
     # 1) Load a random sample of GSM8K examples from Hugging Face.
-    num_samples = 32
-    examples = load_random_gsm8k(num_samples=num_samples, seed=42)
+    examples = load_random_gsm8k(num_samples=args.num_samples, seed=args.seed)
 
     # 2) Load model and tokenizer.
-    model_name = "meta-llama/Llama-3.2-1B-Instruct"  # Update to your actual model name
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.float16)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     model.eval()
 
     # 3) Set up the stream manager with your parameters.
-    stream_width = 16
-    max_length = 250
-    use_kv_cache = True
-    continuous_batching = True
-    num_completions = 2
-
-    wandb.init(
-        project="pipeline-profiling",
-        entity="multi-answer-spec-decoding",
-        config={
-            "model_name": model_name,
-            "num_samples": num_samples,
-            "stream_width": stream_width,
-            "max_length": max_length,
-            "num_completions": num_completions,
-            "use_kv_cache": use_kv_cache,
-            "continuous_batching": continuous_batching,
-        }
-    )
+    if args.use_wandb:
+        print("Initializing wandb")
+        wandb.init(
+            project="pipeline-profiling",
+            entity="multi-answer-spec-decoding",
+            config={
+                "model_name": args.model_name,
+                "num_samples": args.num_samples,
+                "stream_width": args.stream_width,
+                "max_length": args.max_length,
+                "num_completions": args.num_completions,
+                "use_kv_cache": args.use_kv_cache,
+                "continuous_batching": args.continuous_batching,
+                "seed": args.seed,
+            }
+        )
 
     stream_manager = StreamManager(
         model,
         tokenizer,
-        stream_width=stream_width,
-        max_length=max_length,
-        use_kv_cache=use_kv_cache,
-        continuous_batching=continuous_batching,
-        logger=wandb
+        stream_width=args.stream_width,
+        max_length=args.max_length,
+        use_kv_cache=args.use_kv_cache,
+        continuous_batching=args.continuous_batching,
+        logger=wandb if args.use_wandb else None
     )
 
-    print(f"Stream manager initialized: stream_width={stream_width}, max_length={max_length}")
-    print(f"continuous_batching={continuous_batching}, use_kv_cache={use_kv_cache}")
+    print(f"Stream manager initialized: stream_width={args.stream_width}, max_length={args.max_length}")
+    print(f"continuous_batching={args.continuous_batching}, use_kv_cache={args.use_kv_cache}")
 
     # 4) Define your prompt template.
     template_text = textwrap.dedent("""
@@ -109,7 +122,7 @@ def main():
 
     # 6) Enqueue all prompts with desired completions.
     for prompt in prompt_map.keys():
-        stream_manager.enqueue_prompt(prompt, num_completions)
+        stream_manager.enqueue_prompt(prompt, args.num_completions)
 
     # 7) Run the generation loop.
     start = time.time()
