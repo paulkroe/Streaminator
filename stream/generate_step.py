@@ -103,7 +103,7 @@ def _generate_step_with_kv(self, proposals=None):
         mask = torch.cat([mask, pad], dim=1)
 
     # 3) model forward
-    print(batched[0][0].shape)
+    # print(batched[0][0].shape)
     with torch.no_grad():
         out = self.model(
             input_ids=input_ids,
@@ -112,7 +112,7 @@ def _generate_step_with_kv(self, proposals=None):
             use_cache=True,
             attention_mask=mask
         )
-    print(out.past_key_values[0][0].shape)
+    # print(out.past_key_values[0][0].shape)
 
     # 4) slice off the logits we need
     if proposals is None:

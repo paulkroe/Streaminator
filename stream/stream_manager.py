@@ -184,6 +184,7 @@ class StreamManager:
                     ) for k,v in seq.kv_cache]
 
     def _get_batched_kv(self):
+        # print("_get_batched_kv")
         if not self.active_seqs:
             return None
         layers = len(self.active_seqs[0].kv_cache)
@@ -192,6 +193,8 @@ class StreamManager:
             ks = [s.kv_cache[i][0] for s in self.active_seqs]
             vs = [s.kv_cache[i][1] for s in self.active_seqs]
             batched.append((torch.cat(ks,0), torch.cat(vs,0)))
+        # print([s.kv_cache[0][0].shape[-2] for s in self.active_seqs])
+        # print([s.kv_cache[0][1].shape[-2] for s in self.active_seqs])
         return tuple(batched)
 
     def _build_leftpad_attention_mask(self):
@@ -223,11 +226,8 @@ class StreamManager:
         still_active = []
         for seq in self.active_seqs:
             if seq.is_finished() or self.tokenizer.eos_token_id in seq.generated_tokens:
-                print(seq.generated_tokens)
-                print(f"Finished sequence: {seq.qid}")
                 # Collect final text
                 text = self.tokenizer.decode(seq.get_final_generation(), skip_special_tokens=True)
-                print(f"Final text: {self.tokenizer.decode(seq.generated_tokens, skip_special_tokens=False)}")
                 self.results.setdefault(seq.prompt_text, []).append(text)
                 # Free KV cache and sequence
                 # seq.kv_cache = None
@@ -255,7 +255,7 @@ class StreamManager:
         else do standard static.
         """
         if self.spec_decoding:
-            Raise NotImplementedError("We need to realign the KV cache anyways when doing speculative decoding. Please use continuous generation directly.")
+            raise NotImplementedError("We need to realign the KV cache anyways when doing speculative decoding. Please use continuous generation directly.")
         # original static
         self._refill_active_seqs()
         step = 0
@@ -285,9 +285,8 @@ class StreamManager:
         self._refill_active_seqs()
         step = 0
         while self.active_seqs or self.prompt_deque:
-            if step % self.refill_period == 0:
-                self._cleanup_and_refill()
-                print("================")
+            self._cleanup_and_refill()
+            # print("================")
             if self.spec_decoding:
                 # 1) Build proposals and collect q-distributions
                 proposals, q_dists = [], []
@@ -324,6 +323,8 @@ class StreamManager:
 
                     # acceptance mask
                     mask = self._accept_speculative(q_token_probs, p_token_probs)
+                    # if mask[0]:
+                    #    print(q_token_probs, p_token_probs)
 
                     # append accepted proposal tokens
                     accepted_ids = ids[mask].tolist()
@@ -343,25 +344,40 @@ class StreamManager:
                     seq.append_token(int(t))
 
                     if self.use_kv_cache:
-                        num_appended    = len(accepted_ids) + 1
-                        old_kv          = seq.kv_cache                 # List[(k_old, v_old)]
-                        new_kv_slices   = per_seq_past[i]               # List[(k_new, v_new)]
-                        updated_kv      = []
+                        old_kv        = seq.kv_cache               # List of (k_old, v_old)
+                        new_kv_slices = per_seq_past[i]             # List of (k_new_all, v_new_all)
+                        updated_kv    = []
 
-                        for (k_old, v_old), (k_new, v_new) in zip(old_kv, new_kv_slices):
-                            # k_new/v_new shape: (1, heads, γ, head_dim)
-                            k_append = k_new[..., :num_appended, :]
-                            v_append = v_new[..., :num_appended, :]
+                        # mask: Boolean tensor of shape [γ], true where proposal was accepted
+                        accepted_idxs = mask.nonzero(as_tuple=False).view(-1)  # e.g. tensor([0, 2, ...])
+                        # final_idx was computed above: the index in [0..γ-1] from which we sampled
+                        # Build a Python list of all positions to append: accepted proposals + the final token
+                        indices = accepted_idxs.tolist() + [final_idx]
 
+                        for (k_old, v_old), (k_new_all, v_new_all) in zip(old_kv, new_kv_slices):
+                            # k_new_all/v_new_all have shape (1, heads, γ, head_dim)
+                            # gather exactly those slices
+                            k_append = k_new_all[..., indices, :]  # (1, heads, len(indices), head_dim)
+                            v_append = v_new_all[..., indices, :]
+
+                            # concatenate onto the old cache along the sequence dim (dim=2)
                             k_cat = torch.cat([k_old, k_append], dim=2)
                             v_cat = torch.cat([v_old, v_append], dim=2)
                             updated_kv.append((k_cat, v_cat))
-                        if mask[0]:
-                            assert seq.kv_cache[0][0].shape[2] + 2 == updated_kv[0][0].shape[2], f"accept: seq.kv_cache[0][0].shape={seq.kv_cache[0][0].shape}, updated_kv[0][0].shape={updated_kv[0][0].shape}"
-                        else:
-                            assert seq.kv_cache[0][0].shape[2] + 1 == updated_kv[0][0].shape[2], f"not accept: seq.kv_cache[0][0].shape={seq.kv_cache[0][0].shape}, updated_kv[0][0].shape={updated_kv[0][0].shape}"
+
+                        # sanity-check: cache should grow by len(indices)
+                        prev_len = seq.kv_cache[0][0].shape[2]
+                        new_len  = updated_kv[0][0].shape[2]
+                        assert new_len - prev_len == len(indices), (
+                            f"KV grew by {new_len - prev_len} but expected {len(indices)}"
+                        )
+
                         seq.kv_cache = updated_kv
-            else:
+
+            # for s in self.active_seqs:
+            #     print(s.kv_cache[0][0].shape[-2])
+            # print("++++++++++++")
+            if False:
                 # regular single-token continuous generation
                 logits, new_past = (
                     self._generate_step_with_kv() if self.use_kv_cache
