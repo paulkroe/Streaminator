@@ -20,13 +20,17 @@ class NGram:
         self.unigram = defaultdict(int)
         self.total_unigram = 0
 
-    def train(self, texts):
+    def train(self, texts, tokenized=False):
         """
         Train model on an iterable of text strings.
         Only counts token IDs < vocab_size.
         """
+        # print("Training NGram model", texts[0])
         for text in texts:
-            tokens = self.tokenizer(text, return_tensors='pt').input_ids[0].tolist()
+            if not tokenized:
+                tokens = self.tokenizer(text, return_tensors='pt').input_ids[0].tolist()
+            else:
+                tokens = text
             # unigram counts
             for t in tokens:
                 if 0 <= t < self.vocab_size:
@@ -55,6 +59,7 @@ class NGram:
         over the vocabulary as a 1D tensor of length vocab_size.
         Only uses counts for token IDs < vocab_size.
         """
+        # print("context_tensor", context_tensor)
         dist = torch.zeros(self.vocab_size, device=context_tensor.device)
         ctx = context_tensor.tolist()
         if len(ctx) >= self.order - 1:

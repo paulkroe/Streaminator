@@ -26,7 +26,10 @@ class StreamManager:
         refill_period=5,
         use_kv_cache=True,
         continuous_batching=True,
+        prompt_training_only=False,
         spec_decoding=True,
+        ngram_order=3,
+        gamma=1,
         logger=None,
         debug=False
     ):
@@ -38,13 +41,14 @@ class StreamManager:
         self.use_kv_cache = use_kv_cache
         self.continuous_batching = continuous_batching
         self.spec_decoding = spec_decoding
+        self.prompt_training_only = prompt_training_only
         self.debug = debug
         self.logger = logger
 
         self.ngram_registry = {}
         self.next_qid = 0
-        self.n_ngram = 0
-
+        self.ngram_order = ngram_order
+        self.gamma = gamma
         self.gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
 
         self.prompt_deque = deque()
@@ -74,13 +78,20 @@ class StreamManager:
             mem_info = pynvml.nvmlDeviceGetMemoryInfo(self.gpu_handle)
         except pynvml.NVMLError as e:
             self._debug_print(f"Failed to log GPU stats: {e}")
+        
         stream_utilization = sum(not seq.is_finished() for seq in self.active_seqs) / self.stream_width * 100
+        n_active_seqs = len(self.active_seqs)
+        if n_active_seqs > 0:
+            acceptance_rate = (self.accepted_proposals / n_active_seqs) * 100
+        else:
+            acceptance_rate = 0
         self.logger.log({
             "gpu SM utilization (%)": util.gpu,
             "gpu memory (MB)": mem_info.used / 1024**2,
             "gpu memory usage (%)": mem_info.used / mem_info.total * 100,
             "generation step": step,
             "stream utilization (%)": stream_utilization,
+            "acceptance rate (%)": acceptance_rate,
         })
 
     def _debug_print(self, msg):
@@ -129,7 +140,7 @@ class StreamManager:
 
         # Lazy-create the n-gram model if needed
         if self.spec_decoding and self.ngram_registry[qid]['model'] is None:
-            self.ngram_registry[qid]['model'] = NGram(self.tokenizer, self.n_ngram)
+            self.ngram_registry[qid]['model'] = NGram(self.tokenizer, self.ngram_order)
             self.ngram_registry[qid]['model'].train([prompt_text])
 
         # Sample the first non-prompt token
@@ -205,11 +216,7 @@ class StreamManager:
             mask[i, T-v:]=1
         return mask.long()
 
-    def _accept_speculative(
-        self,
-        q_probs: torch.Tensor,    # shape: (γ,)
-        p_probs: torch.Tensor     # shape: (γ,) or (γ+1,)
-    ) -> torch.BoolTensor:
+    def _accept_speculative(self, q_probs: torch.Tensor, p_probs: torch.Tensor) -> torch.BoolTensor:
         """
         Given draft-model probabilities q_i and full-model probabilities p_i for
         i=1..γ, return a boolean mask of length γ indicating which proposed tokens
@@ -251,8 +258,11 @@ class StreamManager:
         for seq in self.active_seqs:
             if seq.is_finished() or self.tokenizer.eos_token_id in seq.generated_tokens:
                 # Collect final text
-                text = self.tokenizer.decode(seq.get_final_generation(), skip_special_tokens=True)
+                tokens = seq.get_final_generation()
+                text = self.tokenizer.decode(tokens, skip_special_tokens=True)
                 self.results.setdefault(seq.prompt_text, []).append(text)
+                if self.spec_decoding and not self.prompt_training_only:
+                    self.ngram_registry[seq.qid]['model'].train([tokens], tokenized=True)
                 # Free KV cache and sequence
                 # seq.kv_cache = None
                 if self.spec_decoding:
@@ -333,12 +343,12 @@ class StreamManager:
         while self.active_seqs or self.prompt_deque:
             self._cleanup_and_refill()
             if self.spec_decoding:
+                self.accepted_proposals = 0
                 # 1) Build proposals and collect q-distributions
                 proposals, q_dists = [], []
                 for seq in self.active_seqs:
                     ngram = self.ngram_registry[seq.qid]['model']
-                    # TODO: full_input include padding i think
-                    ctx = seq.full_input()                # 1D tensor
+                    ctx = seq.full_input()[-self.ngram_order:]    # 1D tensor
                     xs, dists = [], []
                     cur = ctx.clone()
                     for _ in range(self.gamma):
@@ -368,7 +378,7 @@ class StreamManager:
                     idx     = torch.arange(gamma, device=ids.device)
 
                     # acceptance test on the γ draft tokens
-                    p_token_probs = p_block[:gamma, ids]              # p₁…p_γ vs. q₁…q_γ
+                    p_token_probs = p_block[:gamma, ids]              # p1...p_gamma vs. q1...q_gamma
                     q_token_probs = q_dists[i][idx, ids]
                     mask = self._accept_speculative(q_token_probs, p_token_probs.squeeze(1))
 
@@ -377,8 +387,12 @@ class StreamManager:
                     accepted_ids = ids[mask].tolist()
                     for tok in accepted_ids:
                         seq.append_token(int(tok))
-                    #     print("ACCEPTED")
-                    #     print(f"seq: {i}, Accepted token: {tok}, {self.tokenizer.decode([tok])}")
+                        self.accepted_proposals += 1
+                        # print("ACCEPTED")
+                        # print(f"seq: {i}, Accepted token: {tok}, {self.tokenizer.decode([tok])}")
+                        # print(f"alternative: {self.tokenizer.decode(PromptSampler.sample_token(p_token_probs[0]))}")
+                        # print(f"seq: {i}, p_token_probs: {p_token_probs[mask].tolist()}")
+                        # print(f"seq: {i}, q_token_probs: {q_token_probs[mask].tolist()}")
 
                     # print(f"seq: {i}, n={n}, mask={mask.tolist()}")
 
@@ -445,6 +459,9 @@ class StreamManager:
                             updated_kv.append((k_cat, v_cat))
 
                         seq.kv_cache = updated_kv
+
+            step += 1
+            self._log_gpu_stats(step)
 
     def run_generation_loop(self):
         self.pbar = tqdm(total=self.len_queue, desc="Generating...")
