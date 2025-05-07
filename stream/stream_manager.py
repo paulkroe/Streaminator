@@ -3,7 +3,7 @@ import torch
 import torch.nn.functional as F
 import json
 import gc
-from collections import deque
+from collections import deque, defaultdict
 from torch.nn.utils.rnn import pad_sequence
 from .prompt_sampler import PromptSampler
 from .kv_cache_manager import KVCacheManager
@@ -62,6 +62,9 @@ class StreamManager:
 
         if self.logger:
             self.events = self.logger.Table(columns=["step", "prompt"])
+            self.acceptance_dict = defaultdict(int)
+            self.completion_level_acceptance = defaultdict(int)
+            self.completion_level_count = defaultdict(int)
 
         self.len_queue = 0
 
@@ -81,10 +84,21 @@ class StreamManager:
         
         stream_utilization = sum(not seq.is_finished() for seq in self.active_seqs) / self.stream_width * 100
         n_active_seqs = len(self.active_seqs)
-        if n_active_seqs > 0:
-            acceptance_rate = (self.accepted_proposals / n_active_seqs) * 100
-        else:
-            acceptance_rate = 0
+        
+        acceptance_rate = 0
+        if self.spec_decoding:
+
+            if n_active_seqs > 0:
+                accepted_proposals = sum(1 for i in self.log_accepted_token if i is not None)
+                acceptance_rate = (accepted_proposals / n_active_seqs) * 100
+            
+            for i, (level, token) in enumerate(zip(self.log_q_level, self.log_accepted_token)):
+                self.completion_level_count[level] += 1
+                if token is not None:
+                    self.completion_level_acceptance[level] += 1
+                    self.acceptance_dict[token] += 1
+
+
         self.logger.log({
             "gpu SM utilization (%)": util.gpu,
             "gpu memory (MB)": mem_info.used / 1024**2,
@@ -105,7 +119,7 @@ class StreamManager:
 
         # track how many sequences will use this n-gram
         if self.spec_decoding:
-            self.ngram_registry[qid] = {'model': None, 'ref_count': num_completions}
+            self.ngram_registry[qid] = {'model': None, 'count': 0, 'num_completions': num_completions}
 
         self.len_queue += num_completions
         self._debug_print(f"Enqueue prompt: {prompt_text[:60]!r}, num_completions={num_completions}")
@@ -267,8 +281,8 @@ class StreamManager:
                 # seq.kv_cache = None
                 if self.spec_decoding:
                     reg = self.ngram_registry[seq.qid]
-                    reg['ref_count'] -= 1
-                    if reg['ref_count'] == 0:
+                    reg['count'] += 1
+                    if reg['count'] == reg['num_completions']:
                         del self.ngram_registry[seq.qid]
                 if self.use_kv_cache:
                     self.prompt_kv_cache.pop(seq.prompt_text, None)
@@ -343,11 +357,14 @@ class StreamManager:
         while self.active_seqs or self.prompt_deque:
             self._cleanup_and_refill()
             if self.spec_decoding:
-                self.accepted_proposals = 0
+                self.log_accepted_token = [None] * len(self.active_seqs)
+                self.log_q_level = [None] * len(self.active_seqs)
+
                 # 1) Build proposals and collect q-distributions
                 proposals, q_dists = [], []
-                for seq in self.active_seqs:
+                for i, seq in enumerate(self.active_seqs):
                     ngram = self.ngram_registry[seq.qid]['model']
+                    self.log_q_level[i] = self.ngram_registry[seq.qid]['count']
                     ctx = seq.full_input()[-self.ngram_order:]    # 1D tensor
                     xs, dists = [], []
                     cur = ctx.clone()
@@ -387,7 +404,7 @@ class StreamManager:
                     accepted_ids = ids[mask].tolist()
                     for tok in accepted_ids:
                         seq.append_token(int(tok))
-                        self.accepted_proposals += 1
+                        self.log_accepted_token[i] = tok
                         # print("ACCEPTED")
                         # print(f"seq: {i}, Accepted token: {tok}, {self.tokenizer.decode([tok])}")
                         # print(f"alternative: {self.tokenizer.decode(PromptSampler.sample_token(p_token_probs[0]))}")
@@ -401,7 +418,7 @@ class StreamManager:
                     if n < gamma:
                         draft = q_dists[i][n]                         # q_{n+1}
                         diff  = (base - draft).clamp(min=0.0)
-                        if (diff.sum().item() > 0) and False:
+                        if (diff.sum().item() > 0):
                             final_dist = diff / diff.sum()
                         else:
                             final_dist = base

@@ -188,26 +188,49 @@ def main():
     print(f"Overall match@n rate:    {overall_match_n:.3f}")
     print(f"Correct generations:     {overall_correct_fraction:.3f} of all completions")
 
-    if args.use_wandb:
-        wandb.log({
-            "overall_pass@n_rate": overall_pass_n,
-            "overall_match@n_rate": overall_match_n,
-            "overall_correct_fraction": overall_correct_fraction
-        })
-
     # 11) Compute and log average completion length
     all_completion_lengths = [
         len(tokenizer.encode(g, add_special_tokens=False))
         for completions in stream_manager.results.values()
         for g in completions
     ]
+
     avg_completion_length = (
         sum(all_completion_lengths) / len(all_completion_lengths)
         if all_completion_lengths else 0.0
     )
+
     print(f"Average completion length (in tokens): {avg_completion_length:.2f}")
+
     if args.use_wandb:
-        wandb.log({"avg_completion_length_tokens": avg_completion_length})
+        metrics = {
+            "overall_pass@n_rate": overall_pass_n,
+            "overall_match@n_rate": overall_match_n,
+            "overall_correct_fraction": overall_correct_fraction,
+        }
+
+        if args.no_spec_decoding:
+            token_acc = {
+                stream_manager.tokenizer.decode([tok_id]): count
+                for tok_id, count in stream_manager.acceptance_dict.items()
+            }
+            token_table = wandb.Table(
+                columns=["token", "accepted_count"],
+                data=list(token_acc.items())
+            )
+            wandb.log({"token_accuracy_table": token_table})
+
+            level_metrics = {
+                f"level_{level}_acceptance": (
+                    stream_manager.completion_level_acceptance[level]
+                    / stream_manager.completion_level_count[level]
+                )
+                for level in stream_manager.completion_level_acceptance.keys()
+            }
+            metrics.update(level_metrics)
+
+        metrics.update({"avg_completion_length": avg_completion_length})
+        wandb.log(metrics)
 
     with open("evaluation_results.json", "w") as f:
         json.dump(results_for_eval, f, indent=2)
