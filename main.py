@@ -236,6 +236,8 @@ def main():
         json.dump(results_for_eval, f, indent=2)
     print("Evaluation results saved to evaluation_results.json")
     
+    stream_manager.profiler.summary()
+
 if __name__ == "__main__":
     main()
     pynvml.nvmlShutdown()

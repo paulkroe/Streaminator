@@ -1,14 +1,13 @@
 import torch
 from collections import defaultdict
 from torch.nn.utils.rnn import pad_sequence
-from .prompt_sampler import PromptSampler
 
 class NGram:
     """
     N-gram language model: stores counts and provides probability distributions.
     Filters out any token IDs >= vocab_size to avoid OOB errors.
     """
-    def __init__(self, tokenizer, order=3):
+    def __init__(self, tokenizer, order=3, profiler=None):
         self.tokenizer = tokenizer
         self.order = order
         self.vocab_size = len(tokenizer) # .vocab_size
@@ -19,13 +18,14 @@ class NGram:
         # unigram fallback counts
         self.unigram = defaultdict(int)
         self.total_unigram = 0
+        self.profiler = profiler
 
     def train(self, texts, tokenized=False):
         """
         Train model on an iterable of text strings.
         Only counts token IDs < vocab_size.
         """
-        # print("Training NGram model", texts[0])
+        self.profiler.start("ngram_train")
         for text in texts:
             if not tokenized:
                 tokens = self.tokenizer(text, return_tensors='pt').input_ids[0].tolist()
@@ -52,6 +52,7 @@ class NGram:
                 context = tuple(context)
                 self.counts[context][nxt] += 1
                 self.context_totals[context] += 1
+            self.profiler.stop("ngram_train")
 
     def __call__(self, context_tensor):
         """
@@ -59,7 +60,7 @@ class NGram:
         over the vocabulary as a 1D tensor of length vocab_size.
         Only uses counts for token IDs < vocab_size.
         """
-        # print("context_tensor", context_tensor)
+        self.profiler.start("ngram_call")
         dist = torch.zeros(self.vocab_size, device=context_tensor.device)
         ctx = context_tensor.tolist()
         if len(ctx) >= self.order - 1:
@@ -98,4 +99,5 @@ class NGram:
         else:
             # uniform over vocab if no data
             dist.fill_(1.0 / self.vocab_size)
+        self.profiler.stop("ngram_call")
         return dist

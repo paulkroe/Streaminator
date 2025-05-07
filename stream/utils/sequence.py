@@ -1,5 +1,6 @@
 # sequence.py remains unchanged
 import torch
+
 class Sequence:
     def __init__(self, prompt_text, max_length, eos_token_id, qid=None):
         self.prompt_text = prompt_text
