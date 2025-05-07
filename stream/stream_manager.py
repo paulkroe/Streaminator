@@ -96,25 +96,29 @@ class StreamManager:
         On-use of KV caching, initialize and update the cache; otherwise, skip cache calls.
         """
         self._debug_print(f"Prefilling prompt: {prompt_text[:60]!r}")
-        inputs = self.tokenizer(prompt_text, return_tensors='pt').to(self.device)
-        prompt_tokens = inputs.input_ids[0]
 
-        # First forward pass to get prefix logits (with or without caching)
-        with torch.no_grad():
+        # Tokenize the input prompt and move it to the appropriate device (e.g., GPU or CPU)
+        inputs = self.tokenizer(prompt_text, return_tensors='pt').to(self.device)
+        prompt_tokens = inputs.input_ids[0]  # Extract the tokenized input IDs
+
+        # Perform the first forward pass through the model to obtain logits
+        # This pass may or may not use KV caching, depending on the configuration
+        with torch.no_grad():  # Disable gradient computation for inference
             outputs = self.model(
-                **inputs,
-                use_cache=self.use_kv_cache,
+                **inputs,  # Pass the tokenized inputs to the model
+                use_cache=self.use_kv_cache,  # Enable or disable KV caching
             )
 
-        # Build sequence object
+        # Create a new Sequence object to manage the generation process for this prompt
         seq = Sequence(
-            prompt_text=prompt_text,
-            max_length=self.max_length,
-            eos_token_id=self.tokenizer.eos_token_id,
-            qid=qid
+            prompt_text=prompt_text,  # The original prompt text
+            max_length=self.max_length,  # Maximum length for the generated sequence
+            eos_token_id=self.tokenizer.eos_token_id,  # End-of-sequence token ID
+            qid=qid  # Unique query ID for tracking this sequence
         )
 
-        seq.set_prompt_tokens(prompt_tokens.clone())
+        # Store the tokenized prompt in the Sequence object
+        seq.set_prompt_tokens(prompt_tokens.clone())  # Clone to avoid unintended modifications
 
         # Lazy-create the n-gram model if needed
         # if self.ngram_registry[qid]['model'] is None:
@@ -172,73 +176,114 @@ class StreamManager:
                     ) for k,v in seq.kv_cache]
 
     def _get_batched_kv(self):
+        """
+        Combine the KV caches of all active sequences into a single batched format.
+        This allows efficient processing of multiple sequences in parallel.
+        """
         if not self.active_seqs:
             return None
-        layers = len(self.active_seqs[0].kv_cache)
-        batched=[]
+        layers = len(self.active_seqs[0].kv_cache)  # Number of layers in the KV cache
+        batched = []
         for i in range(layers):
+            # Collect keys and values for the current layer from all active sequences
             ks = [s.kv_cache[i][0] for s in self.active_seqs]
             vs = [s.kv_cache[i][1] for s in self.active_seqs]
-            batched.append((torch.cat(ks,0), torch.cat(vs,0)))
+            # Concatenate keys and values along the batch dimension
+            batched.append((torch.cat(ks, 0), torch.cat(vs, 0)))
         return tuple(batched)
 
     def _build_leftpad_attention_mask(self):
+        """
+        Build a left-padded attention mask for all active sequences.
+        This ensures that only valid tokens are attended to during generation.
+        """
         if not self.active_seqs:
             return None
-        T = self.active_seqs[0].kv_cache[0][0].shape[2]
-        B = len(self.active_seqs)
-        mask = torch.zeros(B, T+1, device=self.device)
-        for i,seq in enumerate(self.active_seqs):
-            v = seq.get_valid_length()
-            mask[i, T-v:]=1
+        T = self.active_seqs[0].kv_cache[0][0].shape[2]  # Sequence length in the KV cache
+        B = len(self.active_seqs)  # Number of active sequences
+        mask = torch.zeros(B, T + 1, device=self.device)  # Initialize the mask with zeros
+        for i, seq in enumerate(self.active_seqs):
+            v = seq.get_valid_length()  # Get the valid length of the sequence
+            mask[i, T - v:] = 1  # Set the valid positions to 1
         return mask.long()
 
     def _generate_step_with_kv(self):
+        """
+        Perform a single generation step using KV caching for active sequences.
+        This method updates the KV cache and generates the next token for each sequence.
+        """
         if not self.active_seqs:
             return None, None
+
         toks, pos, idle = [], [], 0
         eff_len = lambda s: s.get_valid_length() + (1 if s.is_finished() else 0)
+
+        # Prepare input tokens and position IDs for all active sequences
         for s in self.active_seqs:
-            t = s.next_input_token() or self.tokenizer.eos_token_id
-            if s.is_finished(): idle+=1
-            toks.append(t); pos.append(eff_len(s))
-        if idle==len(self.active_seqs): return None, None
+            t = s.next_input_token() or self.tokenizer.eos_token_id  # Get the next token or EOS token
+            if s.is_finished():
+                idle += 1  # Count finished sequences
+            toks.append(t)
+            pos.append(eff_len(s))
+
+        # If all sequences are finished, return early
+        if idle == len(self.active_seqs):
+            return None, None
+
+        # Convert tokens and positions to tensors
         input_ids = torch.tensor(toks, device=self.device).unsqueeze(1)
         position_ids = torch.tensor(pos, device=self.device).unsqueeze(1)
+
+        # Get batched KV cache and attention mask
         batched = self._get_batched_kv()
         mask = self._build_leftpad_attention_mask()
-        token_mask = torch.ones(len(self.active_seqs),1,device=self.device)
-        mask = torch.cat([mask, token_mask],1)
+        token_mask = torch.ones(len(self.active_seqs), 1, device=self.device)
+        mask = torch.cat([mask, token_mask], 1)
+
+        # Perform the forward pass through the model
         with torch.no_grad():
-            out = self.model(input_ids=input_ids,
-                             position_ids=position_ids,
-                             past_key_values=KVCacheWrapper.wrap(batched,self.model),
-                             use_cache=True,
-                             attention_mask=mask)
-        logits = out.logits[:,-1]
-        new_past = out.past_key_values
-        # split per-seq
-        per=[]
+            out = self.model(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                past_key_values=KVCacheWrapper.wrap(batched, self.model),
+                use_cache=True,
+                attention_mask=mask,
+            )
+
+        logits = out.logits[:, -1]  # Extract logits for the last token
+        new_past = out.past_key_values  # Extract updated KV cache
+
+        # Split the updated KV cache back into per-sequence format
+        per = []
         for i in range(len(self.active_seqs)):
-            seq_kv=[]
+            seq_kv = []
             for layer in new_past:
-                seq_kv.append((layer[0][i:i+1], layer[1][i:i+1]))
+                seq_kv.append((layer[0][i:i + 1], layer[1][i:i + 1]))
             per.append(seq_kv)
+
         return logits, per
 
     def _generate_step_without_kv(self):
+        """
+        Perform a single generation step without using KV caching.
+        This method processes all active sequences in a single forward pass.
+        """
         if not self.active_seqs:
             return None, None
 
         sequences_inputs = []
+
+        # Prepare input tensors for all active sequences
         for seq in self.active_seqs:
-            gen_tensor = torch.tensor(seq.generated_tokens, device=self.device)
-            full_input = torch.cat([seq.prompt_tokens, gen_tensor])
+            gen_tensor = torch.tensor(seq.generated_tokens, device=self.device)  # Generated tokens
+            full_input = torch.cat([seq.prompt_tokens, gen_tensor])  # Combine prompt and generated tokens
             sequences_inputs.append(full_input)
 
+        # Pad sequences to the same length and create an attention mask
         padded = pad_sequence(sequences_inputs, batch_first=True, padding_value=self.tokenizer.eos_token_id).to(self.device)
         attention_mask = (padded != self.tokenizer.eos_token_id).long().to(self.device)
 
+        # Perform the forward pass through the model
         with torch.no_grad():
             outputs = self.model(
                 input_ids=padded,
@@ -247,12 +292,14 @@ class StreamManager:
             )
 
         logits_list = []
+
+        # Extract logits for the last token of each sequence
         for i, seq in enumerate(self.active_seqs):
-            seq_len = sequences_inputs[i].shape[0]
-            last_logits = outputs.logits[i, seq_len - 1, :]
+            seq_len = sequences_inputs[i].shape[0]  # Length of the current sequence
+            last_logits = outputs.logits[i, seq_len - 1, :]  # Logits for the last token
             logits_list.append(last_logits)
 
-        logits_tensor = torch.stack(logits_list, dim=0)
+        logits_tensor = torch.stack(logits_list, dim=0)  # Stack logits into a single tensor
         return logits_tensor, None
 
     def _accept_speculative(self, q_logits: torch.Tensor, p_logits: torch.Tensor) -> torch.BoolTensor:
