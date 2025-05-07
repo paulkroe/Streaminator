@@ -131,9 +131,8 @@ def main():
     start = time.time()
     stream_manager.run_generation_loop()
     end = time.time()
-    print(f"Generation took {end - start:.2f} seconds.")
-    if args.use_wandb:
-        wandb.log({"total_generation_time_sec": end - start})
+    total_generation_time_sec = end - start
+    print(f"Generation took {total_generation_time_sec:.2f} seconds.")
 
     # Count total number of generated tokens (excluding prompt)
     total_generated_tokens = sum(
@@ -142,11 +141,9 @@ def main():
         for gen in completions
     )
 
-    tokens_per_sec = total_generated_tokens / (end - start)
+    tokens_per_sec = total_generated_tokens / total_generation_time_sec
     print(f"Total generated tokens: {total_generated_tokens}")
     print(f"Tokens per second: {tokens_per_sec:.2f}")
-    if args.use_wandb:  
-        wandb.log({"total_generated_tokens": total_generated_tokens, "tokens_per_second": tokens_per_sec})
 
     # 8) Convert StreamManager results into a structure for answer-checking.
     results_for_eval = {
@@ -203,13 +200,18 @@ def main():
     print(f"Average completion length (in tokens): {avg_completion_length:.2f}")
 
     if args.use_wandb:
-        metrics = {
+        wandb_log_dict = {
+            "total_generated_tokens": total_generated_tokens,
+            "tokens_per_second": tokens_per_sec,
+            "total_generation_time_sec": total_generation_time_sec,
+            "avg_completion_length": avg_completion_length,
             "overall_pass@n_rate": overall_pass_n,
             "overall_match@n_rate": overall_match_n,
             "overall_correct_fraction": overall_correct_fraction,
         }
 
         if args.no_spec_decoding:
+            # Token-level acceptance table
             token_acc = {
                 stream_manager.tokenizer.decode([tok_id]): count
                 for tok_id, count in stream_manager.acceptance_dict.items()
@@ -218,8 +220,9 @@ def main():
                 columns=["token", "accepted_count"],
                 data=list(token_acc.items())
             )
-            wandb.log({"token_accuracy_table": token_table})
+            wandb_log_dict["token_accuracy_table"] = token_table
 
+            # Per-level acceptance rates
             level_metrics = {
                 f"level_{level}_acceptance": (
                     stream_manager.completion_level_acceptance[level]
@@ -227,10 +230,28 @@ def main():
                 )
                 for level in stream_manager.completion_level_acceptance.keys()
             }
-            metrics.update(level_metrics)
+            wandb_log_dict.update(level_metrics)
 
-        metrics.update({"avg_completion_length": avg_completion_length})
-        wandb.log(metrics)
+        # Profiling summary table
+        profiling_data = stream_manager.profiler.timings
+        profile_table = wandb.Table(columns=[
+            "component", "calls", "total_time_s", "avg_time_s", "fraction_of_total_time"
+        ])
+        for name, times in profiling_data.items():
+            count = len(times)
+            total_time = sum(times)
+            avg_time = total_time / count if count > 0 else 0
+            fraction = total_time / total_generation_time_sec if total_generation_time_sec > 0 else 0
+            profile_table.add_data(name, count, total_time, avg_time, fraction)
+
+        wandb_log_dict["profiling_summary_table"] = profile_table
+        wandb_log_dict["profiling_overhead_per_token_s"] = (
+            total_generation_time_sec / total_generated_tokens if total_generated_tokens > 0 else 0
+        )
+
+        # Final logging
+        wandb.log(wandb_log_dict)
+
 
     with open("evaluation_results.json", "w") as f:
         json.dump(results_for_eval, f, indent=2)
