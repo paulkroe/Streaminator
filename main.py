@@ -30,6 +30,9 @@ def parse_args():
     parser.add_argument("--no_spec_decoding", action="store_false", default=True, help="Whether to use speculative decoding")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--use_wandb", action="store_true", default=False, help="Whether to use wandb")
+    parser.add_argument("--ngram_order", type=int, default=3, help="Order of the n-gram model")
+    parser.add_argument("--no_prompt_training", action="store_false", default=True, help="Whether to train the NGram on the prompt")
+    parser.add_argument("--no_generation_training", action="store_false", default=True, help="Whether to train the NGram on the generations")
     return parser.parse_args()
 
 def main():
@@ -61,6 +64,9 @@ def main():
                 "kv_cache": args.no_kv_cache,
                 "continuous_batching": args.no_continuous_batching,
                 "spec_decoding": args.no_spec_decoding,
+                "ngram_order": args.ngram_order,
+                "no_prompt_training": args.no_prompt_training,
+                "no_generation_training": args.no_prompt_training,
                 "seed": args.seed,
             }
         )
@@ -73,11 +79,15 @@ def main():
         use_kv_cache=args.no_kv_cache,
         continuous_batching=args.no_continuous_batching,
         spec_decoding=args.no_spec_decoding,
+        no_prompt_training=args.no_prompt_training,
+        no_generation_training=args.no_generation_training,
+        ngram_order=args.ngram_order,
         logger=wandb if args.use_wandb else None
     )
 
     print(f"Stream manager initialized: stream_width={args.stream_width}, max_length={args.max_length}")
     print(f"continuous_batching={args.no_continuous_batching}, kv_cache={args.no_kv_cache}, spec_decoding={args.no_spec_decoding}")
+    print(f"ngram_order={args.ngram_order}, no_prompt_training={args.no_prompt_training}, no_generation_training={args.no_generation_training}")
 
     # 4) Define your prompt template.
     template_text = textwrap.dedent("""

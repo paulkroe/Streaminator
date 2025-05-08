@@ -7,10 +7,10 @@ class NGram:
     N-gram language model: stores counts and provides probability distributions.
     Filters out any token IDs >= vocab_size to avoid OOB errors.
     """
-    def __init__(self, tokenizer, order=3, profiler=None):
+    def __init__(self, tokenizer, order=2, profiler=None):
         self.tokenizer = tokenizer
         self.order = order
-        self.vocab_size = len(tokenizer) # .vocab_size
+        self.vocab_size = len(tokenizer)
         # context -> next-token counts
         self.counts = defaultdict(lambda: defaultdict(int))
         # context -> total count
