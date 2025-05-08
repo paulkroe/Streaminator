@@ -1,11 +1,5 @@
-from data import load_random_gsm8k
 from string import Template
 import textwrap
-
-def load_examples(num_samples, seed):
-    """Load a random sample of GSM8K examples."""
-    return load_random_gsm8k(num_samples=num_samples, seed=seed)
-
 
 def get_prompt_template():
     """Return the prompt template."""

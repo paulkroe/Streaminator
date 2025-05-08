@@ -11,7 +11,7 @@ from .kv_cache_wrapper import KVCacheWrapper
 from .sequence import Sequence
 import pynvml
 from tqdm import tqdm
-import gc
+from utils.logging_utils import Logger
 pynvml.nvmlInit()
 
 class StreamManager:
@@ -34,60 +34,67 @@ class StreamManager:
         self.refill_period = refill_period
         self.use_kv_cache = use_kv_cache
         self.continuous_batching = continuous_batching
-        self.debug = debug
-        self.logger = logger
 
-        self.ngram_registry = {}
-        self.next_qid = 0
-
-        self.gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        # Initialize Logger
+        self.logger = logger or Logger(enable_wandb=False, debug=debug)
 
         self.prompt_deque = deque()
         self.active_seqs = []
         self.results = {}
-        self.prompt_order = []
         self.device = next(model.parameters()).device
 
-        if self.use_kv_cache:
-            self.prompt_kv_cache = {}
+        # Initialize next_qid to track unique query IDs
+        self.next_qid = 0
 
-        if self.logger:
-            self.events = self.logger.Table(columns=["step", "prompt"])
+        # Initialize ngram_registry to track n-grams and their metadata
+        self.ngram_registry = {}
 
+        # Initialize len_queue to track the total number of completions in the queue
         self.len_queue = 0
 
+        # Initialize prompt_order to track the order of prompts
+        self.prompt_order = []
+
+        # Initialize prompt_kv_cache to store KV caches for prompts
+        self.prompt_kv_cache = {}
+
     def _log_gpu_stats(self, step):
-        if not self.logger:
-            return
-        try:
-            util = pynvml.nvmlDeviceGetUtilizationRates(self.gpu_handle)
-            mem_info = pynvml.nvmlDeviceGetMemoryInfo(self.gpu_handle)
-        except pynvml.NVMLError as e:
-            self._debug_print(f"Failed to log GPU stats: {e}")
-        stream_utilization = sum(not seq.is_finished() for seq in self.active_seqs) / self.stream_width * 100
-        self.logger.log({
-            "gpu SM utilization (%)": util.gpu,
-            "gpu memory (MB)": mem_info.used / 1024**2,
-            "gpu memory usage (%)": mem_info.used / mem_info.total * 100,
-            "generation step": step,
-            "stream utilization (%)": stream_utilization,
-        })
+        """
+        Log GPU stats using the Logger.
+        """
+        self.logger.log_gpu_stats(step, self.active_seqs, self.stream_width)
 
     def _debug_print(self, msg):
-        if self.debug:
-            print(f"[DEBUG] {msg}")
+        """
+        Print debug messages using the Logger.
+        """
+        self.logger.debug_print(msg)
 
     def enqueue_prompt(self, prompt_text, num_completions=1):
-        # assign a unique qid for this prompt batch
+        """
+        Enqueue a new prompt for generation.
+
+        Args:
+            prompt_text (str): The prompt text to enqueue.
+            num_completions (int): The number of completions to generate for this prompt.
+        """
+        # Assign a unique qid for this prompt batch
         qid = self.next_qid
         self.next_qid += 1
 
-        # track how many sequences will use this n-gram
+        # Track how many sequences will use this n-gram
         self.ngram_registry[qid] = {'model': None, 'ref_count': num_completions}
 
+        # Update the queue length
         self.len_queue += num_completions
+
+        # Debug print
         self._debug_print(f"Enqueue prompt: {prompt_text[:60]!r}, num_completions={num_completions}")
+
+        # Track the order of prompts
         self.prompt_order.append((prompt_text, qid))
+
+        # Add the prompt to the deque
         self.prompt_deque.append((prompt_text, num_completions, qid))
 
     def _prefill_prompt(self, prompt_text, num_completions, qid):
