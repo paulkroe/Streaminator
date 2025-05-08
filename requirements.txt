@@ -1,1 +1,8 @@
-pynvml
+datasets==3.6.0
+matplotlib==3.10.1
+nvidia_ml_py==12.570.86
+pynvml==12.0.0
+torch==2.7.0
+tqdm==4.67.1
+transformers==4.51.3
+wandb==0.19.11
