@@ -1,5 +1,12 @@
 # Streaminator: Multi-Answer Speculative Decoding
 
+## Team Information
+- *Team Name*: Multi-Answer Speculatice Decoding
+- *Members*:
+  - Paul Kroeger pk2819
+  - Dylan Sattow  dms2315
+  - Xuan Jiang xj2315
+
 Streaminator is an inference pipeline optimized for scenarios where multiple candidate outputs are sampled per prompt. It combines:
 
 - **KV Caching**: Reuses key/value pairs across tokens to minimize redundant computation  
