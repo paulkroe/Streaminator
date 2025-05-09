@@ -16,6 +16,10 @@ def _generate_step_without_kv(self, proposals=None):
     """
     Unified non-KV generation: single-step (proposals=None or [])
     or gamma-step speculative.
+
+    Args:
+        self: The StreamManager instance.
+        proposals: List of length B, each element is a tensor of shape (gamma)
     Returns:
         logits: Tensor of shape (B, vocab) if no proposals,
                 or (B, gamma+1, vocab) if proposals are provided.

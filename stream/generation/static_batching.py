@@ -5,6 +5,9 @@ def _run_generation_static(self):
     """
     Static loop supports spec_decoding flag: if True, fall back to continuous speculative,
     else do standard static.
+
+    Args:
+        self: The StreamManager instance.
     """
 
     self.profiler.start("_run_generation_static")

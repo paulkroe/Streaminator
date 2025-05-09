@@ -15,6 +15,10 @@ import gc
 def _generate_step_with_kv(self, proposals=None):
     """
     Unified KV generation: single-step (proposals=None) or γ-step speculative.
+
+    Args:
+        self: The StreamManager instance.
+        proposals: List of length B, each element is a tensor of shape (γ)
     Returns:
         logits: Tensor of shape (B, vocab) or (B, γ, vocab)
         new_per_seq_kv: List of length B, each element is a list of (k,v) pairs

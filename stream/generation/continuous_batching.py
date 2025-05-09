@@ -3,7 +3,10 @@ from ..utils.prompt_sampler import PromptSampler
 
 def _run_generation_continuous(self):
     """
-    Continuous generation loop with full n-gram distributions for speculative decoding.
+    Continuous generation loop with full n-gram distributions for speculative decoding. 
+
+    Args:
+        self: The StreamManager instance.
     """
     self.profiler.start("_run_generation_continuous")
     self._refill_active_seqs()

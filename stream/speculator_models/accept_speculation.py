@@ -3,11 +3,18 @@ import torch
 def _accept_speculative(self, q_probs: torch.Tensor, p_probs: torch.Tensor) -> torch.BoolTensor:
     """
     Given draft-model probabilities q_i and full-model probabilities p_i for
-    i=1..γ, return a boolean mask of length γ indicating which proposed tokens
+    i=1..gamma, return a boolean mask of length gamma indicating which proposed tokens
     to accept contiguously.
 
-    q_probs.shape = (γ,)
-    p_probs.shape = (γ,)  or  (γ+1,)
+    q_probs.shape = (gamma,)
+    p_probs.shape = (gamma,)  or  (gamma+1,)
+
+    Args:
+        q_probs: The probabilities of the draft model.
+        p_probs: The probabilities of the full model.
+
+    Returns:
+        A boolean mask of length gamma indicating which proposed tokens to accept contiguously.
     """
     self.profiler.start("_accept_speculative")
     # both must be 1D

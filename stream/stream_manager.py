@@ -17,6 +17,25 @@ import types
 pynvml.nvmlInit()
 
 class StreamManager:
+    """
+    StreamManager is responsible for managing the stream of tokens from the model.
+    It is responsible for filling the stream, and for cleaning up the stream when the model is done generating.
+
+    Args: 
+        model: The model to use for generation.
+        tokenizer: The tokenizer to use for generation.
+        stream_width: The width of the stream.
+        max_length: The maximum length of the stream.
+        use_kv_cache: Whether to use a KV cache.
+        continuous_batching: Whether to use continuous batching.
+        no_prompt_training: Whether to not train the NGram on the prompt.
+        no_generation_training: Whether to not train the NGram on the generations.
+        spec_decoding: Whether to use speculative decoding.
+        ngram_order: The order of the n-gram to use for speculative decoding.
+        gamma: The gamma to use for speculative decoding.
+        logger: The logger to use for logging.
+        debug: Whether to use debug mode.
+    """
     def __init__(
         self,
         model,

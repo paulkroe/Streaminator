@@ -6,6 +6,11 @@ class NGram:
     """
     N-gram language model: stores counts and provides probability distributions.
     Filters out any token IDs >= vocab_size to avoid OOB errors.
+
+    Args:
+        tokenizer: The tokenizer to use.
+        order: The order of the n-gram model.
+        profiler: The profiler to use.
     """
     def __init__(self, tokenizer, order=2, profiler=None):
         self.tokenizer = tokenizer
@@ -24,6 +29,13 @@ class NGram:
         """
         Train model on an iterable of text strings.
         Only counts token IDs < vocab_size.
+
+        Args:
+            texts: The texts to train on.
+            tokenized: Whether the texts are already tokenized.
+
+        Returns:
+            The trained model.
         """
         self.profiler.start("ngram_train")
         for text in texts:
@@ -59,6 +71,12 @@ class NGram:
         Given a context tensor of token IDs (1D), return a full probability distribution
         over the vocabulary as a 1D tensor of length vocab_size.
         Only uses counts for token IDs < vocab_size.
+
+        Args:
+            context_tensor: The context tensor of token IDs.
+
+        Returns:
+            The full probability distribution over the vocabulary.
         """
         self.profiler.start("ngram_call")
         dist = torch.zeros(self.vocab_size, device=context_tensor.device)
