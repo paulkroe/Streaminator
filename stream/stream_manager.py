@@ -21,7 +21,7 @@ class StreamManager:
     StreamManager is responsible for managing the stream of tokens from the model.
     It is responsible for filling the stream, and for cleaning up the stream when the model is done generating.
 
-    Args: 
+    Args:
         model: The model to use for generation.
         tokenizer: The tokenizer to use for generation.
         stream_width: The width of the stream.
@@ -75,7 +75,7 @@ class StreamManager:
         self.results = {}
         self.prompt_order = []
         self.device = next(model.parameters()).device
-        
+
         if self.use_kv_cache:
             self.prompt_kv_cache = {}
 
@@ -89,13 +89,11 @@ class StreamManager:
 
         self.gamma = 1
         self.profiler = Profiler()
-        self.vocab_size = len(self.tokenizer)
-        self.uniform_prob_threshold = 2.0 / self.vocab_size
-   
+
     from .generation.generation_loop import run_generation_loop
     from .generation.static_batching import _run_generation_static
-    from .generation.continuous_batching import _run_generation_continuous 
-   
+    from .generation.continuous_batching import _run_generation_continuous
+
     from .generation.generate_step_with_kv import _generate_step_with_kv
     from .generation.generate_step_without_kv import _generate_step_without_kv
 
@@ -103,12 +101,12 @@ class StreamManager:
 
     from .utils.logging import _log_gpu_stats
     from .utils.logging import save_results
-   
+
     from .utils.fill_stream import enqueue_prompt
     from .utils.fill_stream import  _prefill_prompt
     from .utils.fill_stream import  _refill_active_seqs
     from .utils.fill_stream import  _cleanup_and_refill
-    
+
     from .utils.padding import _get_batched_kv
     from .utils.padding import _build_input_ids
     from .utils.padding import _build_leftpad_attention_mask

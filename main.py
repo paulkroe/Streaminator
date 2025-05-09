@@ -14,13 +14,16 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from stream import StreamManager
 from tests import GSM8KAnswerChecker
 from data import load_random_gsm8k
+from experiments.experiments import run_experiments  # Import the experiments module
 import pynvml
-import gc
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Generate and evaluate math problem solutions")
+    parser.add_argument("--mode", type=str, choices=["pipeline", "experiments"], default="pipeline",
+                        help="Mode to run: pipeline or experiments")
     parser.add_argument("--num_samples", type=int, default=32, help="Number of GSM8K examples to sample")
-    parser.add_argument("--model_name", type=str, default="meta-llama/Llama-3.2-1B-Instruct", 
+    parser.add_argument("--model_name", type=str, default="meta-llama/Llama-3.2-1B-Instruct",
                        help="Name of the LLM model to use")
     parser.add_argument("--stream_width", type=int, default=16, help="Stream width for generation")
     parser.add_argument("--max_length", type=int, default=250, help="Maximum length for generation")
@@ -35,14 +38,17 @@ def parse_args():
     parser.add_argument("--no_generation_training", action="store_false", default=True, help="Whether to train the NGram on the generations")
     return parser.parse_args()
 
-def main():
-    # Parse command line arguments
-    args = parse_args()
-    
-    # 1) Load a random sample of GSM8K examples from Hugging Face.
-    examples = load_random_gsm8k(num_samples=args.num_samples, seed=args.seed)
 
-    # 2) Load model and tokenizer.
+def run_pipeline(args):
+    """
+    Run the Streaminator pipeline for generating and evaluating solutions.
+    """
+    print(f"Running pipeline mode with model: {args.model_name}")
+
+    # Load examples
+    examples = load_random_gsm8k(num_samples=args.num_samples, seed=42)
+
+    # Initialize model and tokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.float16)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -72,8 +78,8 @@ def main():
         )
 
     stream_manager = StreamManager(
-        model,
-        tokenizer,
+        model=model,
+        tokenizer=tokenizer,
         stream_width=args.stream_width,
         max_length=args.max_length,
         use_kv_cache=args.no_kv_cache,
@@ -97,7 +103,7 @@ def main():
         Always follow this exact response format:
         1. Put your step-by-step calculation process inside <think> tags, explaining each step clearly.
         2. Provide the final answer in a <boxed> tag, using a clear and simplified format.
-        
+
         Below are two examples. You must never deviate from this format.
         Example 1:
         {{#user}}
@@ -108,7 +114,7 @@ def main():
         2. Double the remaining apples: 14 * 2 = 28
         </think>
         \\boxed{28}
-        
+
         Example 2:
         {{#user}}
         What is the value of (3 + 5) * 2?
@@ -137,142 +143,36 @@ def main():
     for prompt in prompt_map.keys():
         stream_manager.enqueue_prompt(prompt, args.num_completions)
 
-    # 7) Run the generation loop.
-    start = time.time()
+    # Run the generation loop
     stream_manager.run_generation_loop()
-    end = time.time()
-    total_generation_time_sec = end - start
-    print(f"Generation took {total_generation_time_sec:.2f} seconds.")
 
-    # Count total number of generated tokens (excluding prompt)
-    total_generated_tokens = sum(
-        len(tokenizer.encode(gen, add_special_tokens=False))
-        for completions in stream_manager.results.values()
-        for gen in completions
-    )
-
-    tokens_per_sec = total_generated_tokens / total_generation_time_sec
-    print(f"Total generated tokens: {total_generated_tokens}")
-    print(f"Tokens per second: {tokens_per_sec:.2f}")
-
-    # 8) Convert StreamManager results into a structure for answer-checking.
+    # Evaluate results
     results_for_eval = {
         prompt: {
             "generations": stream_manager.results.get(prompt, []),
-            "ground_truth": gold_answer
+            "ground_truth": answer
         }
-        for prompt, gold_answer in prompt_map.items()
+        for prompt, answer in prompt_map.items()
     }
-
-    # 9) Evaluate the results with GSM8KAnswerChecker.
     evaluation = GSM8KAnswerChecker.eval(results_for_eval)
 
-    # 10) Compute overall stats
-    num_questions = len(evaluation)
-    num_pass_n = 0
-    num_match_n = 0
-    num_total_generations = 0
-    num_correct_generations = 0
-
-    for entry in evaluation:
-        evaluated_answers = entry["answers"]
-        eval_metrics = entry["evaluation"]
-        generations = [a["text"] for a in evaluated_answers]
-        if eval_metrics["pass@n"]:
-            num_pass_n += 1
-        if eval_metrics["match@n"]:
-            num_match_n += 1
-        num_total_generations += len(generations)
-        num_correct_generations += sum(
-            answer["answer_eval"]["correct"] for answer in evaluated_answers
-        )
-
-    overall_pass_n = num_pass_n / num_questions if num_questions else 0.0
-    overall_match_n = num_match_n / num_questions if num_questions else 0.0
-    overall_correct_fraction = num_correct_generations / num_total_generations if num_total_generations else 0.0
-
-    print(f"\nOverall pass@n rate:     {overall_pass_n:.3f}")
-    print(f"Overall match@n rate:    {overall_match_n:.3f}")
-    print(f"Correct generations:     {overall_correct_fraction:.3f} of all completions")
-
-    # 11) Compute and log average completion length
-    all_completion_lengths = [
-        len(tokenizer.encode(g, add_special_tokens=False))
-        for completions in stream_manager.results.values()
-        for g in completions
-    ]
-
-    avg_completion_length = (
-        sum(all_completion_lengths) / len(all_completion_lengths)
-        if all_completion_lengths else 0.0
-    )
-
-    print(f"Average completion length (in tokens): {avg_completion_length:.2f}")
-
-    if args.use_wandb:
-        wandb_log_dict = {
-            "total_generated_tokens": total_generated_tokens,
-            "tokens_per_second": tokens_per_sec,
-            "total_generation_time_sec": total_generation_time_sec,
-            "avg_completion_length": avg_completion_length,
-            "overall_pass@n_rate": overall_pass_n,
-            "overall_match@n_rate": overall_match_n,
-            "overall_correct_fraction": overall_correct_fraction,
-        }
-
-        if args.no_spec_decoding:
-            # Token-level acceptance table
-            token_acc = {
-                stream_manager.tokenizer.decode([tok_id]): count
-                for tok_id, count in stream_manager.acceptance_dict.items()
-            }
-            token_table = wandb.Table(
-                columns=["token", "accepted_count"],
-                data=list(token_acc.items())
-            )
-            wandb_log_dict["token_accuracy_table"] = token_table
-
-            # Per-level acceptance rates
-            level_metrics = {
-                f"level_{level}_acceptance": (
-                    stream_manager.completion_level_acceptance[level]
-                    / stream_manager.completion_level_count[level]
-                )
-                for level in stream_manager.completion_level_acceptance.keys()
-            }
-            wandb_log_dict.update(level_metrics)
-
-        # Profiling summary table
-        profiling_data = stream_manager.profiler.timings
-        profile_table = wandb.Table(columns=[
-            "component", "calls", "total_time_s", "avg_time_s", "fraction_of_total_time"
-        ])
-        for name, times in profiling_data.items():
-            count = len(times)
-            total_time = sum(times)
-            avg_time = total_time / count if count > 0 else 0
-            fraction = total_time / total_generation_time_sec if total_generation_time_sec > 0 else 0
-            profile_table.add_data(name, count, total_time, avg_time, fraction)
-
-        wandb_log_dict["profiling_summary_table"] = profile_table
-        wandb_log_dict["profiling_overhead_per_token_s"] = (
-            total_generation_time_sec / total_generated_tokens if total_generated_tokens > 0 else 0
-        )
-
-        # Final logging
-        wandb.log(wandb_log_dict)
+    # Print evaluation metrics
+    print(f"Evaluation results: {evaluation}")
 
 
-    with open("evaluation_results.json", "w") as f:
-        json.dump(results_for_eval, f, indent=2)
-    print("Evaluation results saved to evaluation_results.json")
-    
-    stream_manager.profiler.summary()
+def main():
+    """
+    Main entry point for the Streaminator pipeline or experiments.
+    """
+    args = parse_args()
+
+    if args.mode == "experiments":
+        print("Running experiments mode...")
+        run_experiments()
+    else:
+        print("Running pipeline mode...")
+        run_pipeline(args)
+
 
 if __name__ == "__main__":
     main()
-    pynvml.nvmlShutdown()
-
-    # Free Memory
-    torch.cuda.empty_cache()
-    gc.collect()
