@@ -23,10 +23,10 @@ class StreamManager:
         tokenizer,
         stream_width=8,
         max_length=50,
-        refill_period=5,
         use_kv_cache=True,
         continuous_batching=True,
-        prompt_training_only=False,
+        no_prompt_training=False,
+        no_generation_training=False,
         spec_decoding=True,
         ngram_order=3,
         gamma=1,
@@ -37,11 +37,11 @@ class StreamManager:
         self.tokenizer = tokenizer
         self.stream_width = stream_width
         self.max_length = max_length
-        self.refill_period = refill_period
         self.use_kv_cache = use_kv_cache
         self.continuous_batching = continuous_batching
         self.spec_decoding = spec_decoding
-        self.prompt_training_only = prompt_training_only
+        self.no_prompt_training = no_prompt_training
+        self.no_generation_training = no_generation_training
         self.debug = debug
         self.logger = logger
 
@@ -68,9 +68,10 @@ class StreamManager:
 
         self.len_queue = 0
 
-        # TODO this should be a parameter
         self.gamma = 1
         self.profiler = Profiler()
+        self.vocab_size = len(self.tokenizer)
+        self.uniform_prob_threshold = 2.0 / self.vocab_size
    
     from .generation.generation_loop import run_generation_loop
     from .generation.static_batching import _run_generation_static

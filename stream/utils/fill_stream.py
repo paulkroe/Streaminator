@@ -52,7 +52,8 @@ def _prefill_prompt(self, prompt_text, num_completions, qid):
     # Lazy-create the n-gram model if needed
     if self.spec_decoding and self.ngram_registry[qid]['model'] is None:
         self.ngram_registry[qid]['model'] = NGram(self.tokenizer, self.ngram_order, self.profiler)
-        self.ngram_registry[qid]['model'].train([prompt_text])
+        if self.no_prompt_training:
+            self.ngram_registry[qid]['model'].train([prompt_text])
 
     # Sample the first non-prompt token
     prefix_logits = outputs.logits[0, -1]
@@ -118,7 +119,7 @@ def _cleanup_and_refill(self):
             tokens = seq.get_final_generation()
             text = self.tokenizer.decode(tokens, skip_special_tokens=True)
             self.results.setdefault(seq.prompt_text, []).append(text)
-            if self.spec_decoding and not self.prompt_training_only:
+            if self.spec_decoding and self.no_generation_training:
                 self.ngram_registry[seq.qid]['model'].train([tokens], tokenized=True)
             # Free KV cache and sequence
             # seq.kv_cache = None

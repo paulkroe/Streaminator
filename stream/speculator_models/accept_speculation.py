@@ -26,8 +26,11 @@ def _accept_speculative(self, q_probs: torch.Tensor, p_probs: torch.Tensor) -> t
     # draw uniforms
     r = torch.rand_like(q_probs)
 
-    # accept_i ~ Bernoulli(p_i / q_i)
-    accept = r < (p_slice / q_probs)
+    # Only consider q_probs above certainty threshold (ow uniform distribution gets high acceptance)
+    confident = q_probs > self.uniform_prob_threshold
+
+    # accept_i ~ Bernoulli(p_i / q_i) only if confident
+    accept = (r < (p_slice / q_probs)) & confident
 
     # enforce contiguous acceptance
     first_false = (~accept).nonzero(as_tuple=False)

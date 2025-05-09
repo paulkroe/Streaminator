@@ -20,7 +20,7 @@ def _run_generation_static(self):
     step = 0
 
     while self.active_seqs or self.prompt_deque:
-        if step % self.refill_period == 0:
+        if len(self.active_seqs) == sum([seq.is_finished() or self.tokenizer.eos_token_id in seq.generated_tokens for seq in self.active_seqs]):
             self._cleanup_and_refill()
 
         logits, new_past = (
