@@ -4,19 +4,31 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from stream import StreamManager
 from tests import GSM8KAnswerChecker
 from utils.data_loader import load_random_gsm8k
-from utils.prompt_utils import get_prompt_template, build_prompt_map  # Reuse functions from main.py
+from utils.prompt_utils import get_prompt_template, build_prompt_map
 from .plotting import plot_results
 from utils.logging_utils import Logger
 
+
 def run_experiment(config):
-    logger = Logger(enable_wandb=True, debug=False)
+    """
+    Run a single experiment with the given configuration.
+
+    Args:
+        config (dict): Experiment configuration.
+
+    Returns:
+        dict: Results of the experiment.
+    """
+
+    # Initialize Logger
+    logger = Logger(enable_wandb=config.get("use_wandb", False), debug=config.get("debug", False))
 
     # Load examples and prompt template
-    examples = load_random_gsm8k(num_samples=config["num_prompts"], seed=42)
+    examples = load_random_gsm8k(num_samples=config["num_prompts"], seed=config.get("seed", 42))
     prompt_template = get_prompt_template()
     prompt_map = build_prompt_map(examples, prompt_template)
 
-    # Initialize the model
+    # Initialize the model and tokenizer
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     tokenizer = AutoTokenizer.from_pretrained(config["model_name"])
     model = AutoModelForCausalLM.from_pretrained(config["model_name"], torch_dtype=torch.float16)
@@ -31,6 +43,7 @@ def run_experiment(config):
         max_length=config["max_length"],
         use_kv_cache=config["use_kv_cache"],
         continuous_batching=config["continuous_batching"],
+        spec_decoding=config.get("spec_decoding", False),
         logger=logger
     )
 
@@ -63,6 +76,7 @@ def run_experiment(config):
     }
     evaluation = GSM8KAnswerChecker.eval(results_for_eval)
 
+    # Compute evaluation metrics
     num_questions = len(evaluation)
     num_pass_n = 0
     num_match_n = 0
@@ -86,7 +100,9 @@ def run_experiment(config):
     overall_match_n = float(num_match_n) / float(num_questions) if num_questions else 0.0
     overall_correct_fraction = float(num_correct_generations) / float(num_total_generations) if num_total_generations else 0.0
     avg_completion_length = (
-        float(total_generated_tokens) / float(num_total_generations) if num_total_generations else 0.0
+        sum(len(tokenizer.encode(gen, add_special_tokens=False)) for gen in generations)
+        / len(generations)
+        if generations else 0.0
     )
 
     print(f"Config: {config}")
@@ -99,7 +115,15 @@ def run_experiment(config):
     print(f"Average completion length (in tokens): {avg_completion_length:.2f}")
 
     # Log results
-    logger.log_metrics({"experiment_config": config})
+    logger.log_metrics({
+        "experiment_config": config,
+        "throughput": throughput,
+        "tokens_per_second": tokens_per_second,
+        "overall_pass_n": overall_pass_n,
+        "overall_match_n": overall_match_n,
+        "overall_correct_fraction": overall_correct_fraction,
+        "avg_completion_length": avg_completion_length,
+    })
 
     # Shutdown logger
     logger.shutdown()
@@ -116,12 +140,15 @@ def run_experiment(config):
 
 
 def run_experiments():
+    """
+    Run a series of experiments with different configurations.
+    """
     # Define experiment configurations
     experiments = [
-        {"stream_width": 8, "max_length": 250, "use_kv_cache": False, "continuous_batching": False, "num_prompts": 10, "num_completions": 8, "model_name": "meta-llama/Llama-3.2-1B-Instruct"},
-        {"stream_width": 8, "max_length": 250, "use_kv_cache": True, "continuous_batching": False, "num_prompts": 10, "num_completions": 8, "model_name": "meta-llama/Llama-3.2-1B-Instruct"},
-        {"stream_width": 8, "max_length": 250, "use_kv_cache": False, "continuous_batching": True, "num_prompts": 10, "num_completions": 8, "model_name": "meta-llama/Llama-3.2-1B-Instruct"},
-        {"stream_width": 8, "max_length": 250, "use_kv_cache": True, "continuous_batching": True, "num_prompts": 10, "num_completions": 8, "model_name": "meta-llama/Llama-3.2-1B-Instruct"},
+        {"stream_width": 16, "max_length": 250, "use_kv_cache": False, "continuous_batching": False, "num_prompts": 16, "num_completions": 8, "model_name": "meta-llama/Llama-3.2-1B-Instruct"},
+        {"stream_width": 16, "max_length": 250, "use_kv_cache": True, "continuous_batching": False, "num_prompts": 16, "num_completions": 8, "model_name": "meta-llama/Llama-3.2-1B-Instruct"},
+        {"stream_width": 16, "max_length": 250, "use_kv_cache": False, "continuous_batching": True, "num_prompts": 16, "num_completions": 8, "model_name": "meta-llama/Llama-3.2-1B-Instruct"},
+        {"stream_width": 16, "max_length": 250, "use_kv_cache": True, "continuous_batching": True, "num_prompts": 16, "num_completions": 8, "model_name": "meta-llama/Llama-3.2-1B-Instruct"},
     ]
 
     results = []

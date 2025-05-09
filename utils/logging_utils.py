@@ -1,5 +1,4 @@
 import pynvml
-import wandb
 
 class Logger:
     """
@@ -19,11 +18,26 @@ class Logger:
 
         # Initialize WandB if enabled
         if self.enable_wandb:
-            wandb.init(project="pipeline-profiling", entity="multi-answer-spec-decoding")
+            import wandb
+            wandb.init(project="streaminator", config={})
+        self.tables = {}
 
         # Initialize NVML for GPU stats logging
         pynvml.nvmlInit()
         self.gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+
+    def Table(self, columns):
+        """
+        Create or retrieve a WandB table with the specified columns.
+        If WandB is not enabled, return a mock table.
+        """
+        if not self.enable_wandb:
+            return MockTable(columns)
+        import wandb
+        table_key = tuple(columns)
+        if table_key not in self.tables:
+            self.tables[table_key] = wandb.Table(columns=columns)
+        return self.tables[table_key]
 
     def log_gpu_stats(self, step, active_seqs, stream_width):
         """
@@ -48,6 +62,7 @@ class Logger:
             }
 
             if self.enable_wandb:
+                import wandb
                 wandb.log(log_data)
 
             if self.debug:
@@ -56,6 +71,14 @@ class Logger:
         except pynvml.NVMLError as e:
             if self.debug:
                 print(f"[DEBUG] Failed to log GPU stats: {e}")
+
+    def log(self, data):
+        """
+        Log data to WandB if enabled.
+        """
+        if self.enable_wandb:
+            import wandb
+            wandb.log(data)
 
     def debug_print(self, msg):
         """
@@ -75,6 +98,7 @@ class Logger:
             metrics (dict): A dictionary of metrics to log.
         """
         if self.enable_wandb:
+            import wandb
             wandb.log(metrics)
 
     def shutdown(self):
@@ -82,5 +106,24 @@ class Logger:
         Shutdown the logger and clean up resources.
         """
         if self.enable_wandb:
+            import wandb
             wandb.finish()
         pynvml.nvmlShutdown()
+
+
+class MockTable:
+    """
+    A mock table to use when WandB is not enabled.
+    """
+    def __init__(self, columns):
+        self.columns = columns
+        self.data = []
+
+    def add_data(self, *args):
+        """
+        Mock method to add data to the table.
+        """
+        self.data.append(args)
+
+    def __repr__(self):
+        return f"MockTable(columns={self.columns}, data={self.data})"
