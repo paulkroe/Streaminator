@@ -1,0 +1,2 @@
+python main.py --num_completions 8 --num_samples 128 --max_length 250 --stream_width 64 --use_wandb --no_spec_decoding
+python main.py --num_completions 8 --num_samples 128 --max_length 250 --stream_width 64 --use_wandb --no_spec_decoding --no_continuous_batching

@@ -99,7 +99,7 @@ def _prefill_prompt(self, prompt_text, num_completions, qid):
 
 def _refill_active_seqs(self):
     """
-    Refill the active sequences with new tokens.
+    Refill stream with new active sequences.
 
     Args:
         self: The StreamManager instance.
