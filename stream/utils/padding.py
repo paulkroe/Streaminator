@@ -1,6 +1,15 @@
 import torch
 
 def _build_leftpad_attention_mask(self):
+    """
+    Build the leftpad attention mask.
+
+    Args:
+        self: The StreamManager instance.
+    
+    Returns:
+        The leftpad attention mask.
+    """
     self.profiler.start("_build_leftpad_attention_mask")
     if not self.active_seqs:
         self.profiler.stop("_build_leftpad_attention_mask")
@@ -15,6 +24,16 @@ def _build_leftpad_attention_mask(self):
     return mask.long()
 
 def _build_input_ids(self, proposals=None):
+    """
+    Build the input IDs.
+
+    Args:
+        self: The StreamManager instance.
+        proposals: The proposals to build the input IDs with.
+
+    Returns:
+        The input IDs.
+    """
     self.profiler.start("_build_input_ids")
     B = len(self.active_seqs)
     # collect the next “real” token and its position
@@ -49,6 +68,15 @@ def _build_input_ids(self, proposals=None):
     return input_ids, position_ids, False
 
 def _get_batched_kv(self):
+    """
+    Get the batched KV.
+
+    Args:
+        self: The StreamManager instance.
+    
+    Returns:
+        The batched KV.
+    """
     self.profiler.start("_get_batched_kv")
     if not self.active_seqs:
         self.profiler.stop("_get_batched_kv")

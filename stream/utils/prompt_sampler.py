@@ -5,6 +5,19 @@ import torch
 class PromptSampler:
     @staticmethod
     def sample_token(logits, temperature=1.0, top_k=1, top_p=0.95, is_dist=False):
+        """
+        Sample a token from the logits.
+
+        Args:
+            logits: The logits to sample from.
+            temperature: The temperature to sample from.
+            top_k: The top-k to sample from.
+            top_p: The top-p to sample from.
+            is_dist: Whether the logits are a distribution.
+
+        Returns:
+            The sampled token.
+        """
         # logits: torch.Tensor of shape [vocab_size]
         if not is_dist:
             if temperature != 1.0:

@@ -2,6 +2,15 @@
 import torch
 
 class Sequence:
+    """
+    A sequence object for the stream manager.
+
+    Args:
+        prompt_text: The prompt text.
+        max_length: The maximum length of the sequence.
+        eos_token_id: The EOS token ID.
+        qid: The question ID.
+    """
     def __init__(self, prompt_text, max_length, eos_token_id, qid=None):
         self.prompt_text = prompt_text
         self.max_length = max_length

@@ -2,6 +2,13 @@ import pynvml
 import json
 
 def _log_gpu_stats(self, step):
+    """
+    Log the GPU stats.
+
+    Args:
+        self: The StreamManager instance.
+        step: The current step.
+    """
     if not self.logger:
         return
     try:
@@ -37,6 +44,13 @@ def _log_gpu_stats(self, step):
     })
 
 def save_results(self, filename):
+    """
+    Save the results to a file.
+
+    Args:
+        self: The StreamManager instance.
+        filename: The filename to save the results to.
+    """
     ordered={}
     for p, _ in self.prompt_order:
         ordered[p]=self.results.get(p,[])

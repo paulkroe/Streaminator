@@ -9,6 +9,16 @@ from ..kv_cache.kv_cache_wrapper import KVCacheWrapper
 import gc
 
 def enqueue_prompt(self, prompt_text, num_completions=1):
+    """
+    Enqueue a prompt for generation.
+
+    Args:
+        prompt_text: The prompt to enqueue.
+        num_completions: The number of completions to enqueue.
+
+    Returns:
+        The number of sequences enqueued.
+    """
     self.profiler.start("enqueue_prompt")
     # assign a unique qid for this prompt batch
     qid = self.next_qid
@@ -27,6 +37,14 @@ def _prefill_prompt(self, prompt_text, num_completions, qid):
     """
     Prefill a single completion for `prompt_text`, sampling one token.
     On-use of KV caching, initialize and update the cache; otherwise, skip cache calls.
+
+    Args:
+        prompt_text: The prompt to prefill.
+        num_completions: The number of completions to prefill.
+        qid: The unique ID for this prompt batch.
+
+    Returns:
+        The number of sequences enqueued.
     """
     self.profiler.start("_prefill_prompt")
     inputs = self.tokenizer(prompt_text, return_tensors='pt').to(self.device)
@@ -80,6 +98,15 @@ def _prefill_prompt(self, prompt_text, num_completions, qid):
     return [seq]
 
 def _refill_active_seqs(self):
+    """
+    Refill the active sequences with new tokens.
+
+    Args:
+        self: The StreamManager instance.
+
+    Returns:
+        The number of sequences enqueued.
+    """
     self.profiler.start("_refill_active_seqs")
     eff_len = lambda s: s.get_valid_length() + (1 if s.is_finished() else 0)
     # trim old
@@ -111,6 +138,15 @@ def _refill_active_seqs(self):
     self.profiler.stop("_refill_active_seqs")
 
 def _cleanup_and_refill(self):
+    """
+    Cleanup and refill the active sequences.
+
+    Args:
+        self: The StreamManager instance.
+
+    Returns:
+        The number of sequences enqueued.
+    """
     self.profiler.start("_cleanup_and_refill")
     still_active = []
     for seq in self.active_seqs:
