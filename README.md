@@ -65,7 +65,7 @@ Run a series of experiments with different configurations to evaluate the impact
 python3 main.py --mode experiments
 ```
 
-Example Command
+Example Command:
 
 ```
 python3 main.py --mode pipeline --model_name meta-llama/Llama-3.2-1B-Instruct --num_samples 32 --stream_width 1
