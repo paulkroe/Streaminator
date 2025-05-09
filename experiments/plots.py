@@ -3,6 +3,18 @@ import pandas as pd
 import seaborn as sns
 plt.style.use('ggplot')
 
+def create_levels_plot(data):
+    propmt_gen = []
+    prompt = []
+    gen = []
+    for lv in data:
+        propmt_gen.append(lv['prompt_gen'])
+        prompt.append(lv['prompt'])
+        gen.append(lv['gen'])
+    plt.figure(figsize=(10, 6))
+    plt.bar(prompt, propmt_gen)
+    plt.show()
+
 def create_zipf_plot(data):
     data = data.sort_values(by='accepted_count', ascending=False)
     data = data.head(50)
