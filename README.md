@@ -99,7 +99,7 @@ python main.py \
 
 ## Reproducing Experiments
 
-All run data, including profiling details, is available in our public Weights & Biases report [here](LINK).
+All run data, including profiling details, is available in our public Weights & Biases report [here](https://wandb.ai/multi-answer-spec-decoding/pipeline-profiling/reports/Experiment-Data--VmlldzoxMjY4NTAxNw?accessToken=sq40o4vb87nn8q0nsb2itye70gcwankbzh0l0zsk1rl875u5uwgpd88n4xecaw49).
 
 To regenerate the data run:
 
