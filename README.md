@@ -1,12 +1,15 @@
-# Streaminator: Multi-Answer Speculative Decoding
+# HPML Project: Streaminator: Multi-Answer Speculative Decoding
 
 ## Team Information
-- *Team Name*: Multi-Answer Speculatice Decoding
-- *Members*:
-  - Paul Kroeger pk2819
-  - Dylan Sattow  dms2315
-  - Xuan Jiang xj2315
+- **Team Name**: Streaminator
+- **Members**:
+  - Paul Kroeger (pk2819)
+  - Dylan Sattow (dms2315)
+  - Xuan Jiang (xj2315)
 
+---
+
+## 1. Problem Statement
 Streaminator is an inference pipeline optimized for scenarios where multiple candidate outputs are sampled per prompt. It combines:
 
 - **KV Caching**: Reuses key/value pairs across tokens to minimize redundant computation  
@@ -17,7 +20,7 @@ Unlike standard speculative decoding—which relies on a single generic draft mo
 
 ---
 
-## Pipeline Architecture
+## 2. Model Description
 
 Streaminator processes prompts in a continuous stream. Each sequence maintains its own KV cache and n-gram speculator, and tokens are generated in lockstep. If needed, padding is introduced as needed to accommodate speculative decoding and continuous batching.
 
@@ -30,7 +33,11 @@ The core pipeline stages of the pipeline are visualized in the flowchart below.
 To ensure each prompt’s speculator only learns from its own history, Streaminator tries to prevent multiple active generations of the same prompt from coexisting in the stream.
 
 ![Pipeline Constraint](./images/pipeline_constraint.jpg)
-## Results
+
+---
+
+## 3. Final Results Summary
+
 
 Primarily we demonstrate that small, per-prompt n-gram speculator models significantly improve token acceptance rates over multiple generations. We compare three training regimes:
 
@@ -47,12 +54,12 @@ Analyzing the distribution of accepted tokens reveals a clear power-law.
 ![Power-Law Distribution of Accepted Tokens](./images/token_distribution.jpeg)
 
 
-## Performance Analysis
-
 Although our per-prompt speculator models achieve high acceptance rates, the current implementation incurs substantial overhead, preventing us from fully realizing these gains. Profiling the pipeline with speculative decoding reveals two hotspots:
 
 - **N-gram Forward Passes**: Frequent calls to the n-gram model account for roughly 10% of total runtime.  
 - **Acceptance Decision Logic**: The function that evaluates and commits speculative tokens also contributes about 10% of runtime.
+
+**Profiling**
 
 ![Profiling Results](./images/profiling.jpeg)
 
@@ -62,7 +69,12 @@ Finally, we evaluated the impact of continuous batching on resource utilization.
 
 ![Continuous vs. Static Batching](./images/memory_profiling.jpeg)
 
-## Installation
+
+---
+
+## 4. Reproducibility Instructions
+
+### A. Requirements
 
 ```bash
 git clone https://github.com/paulkroe/Streaminator.git
@@ -77,7 +89,13 @@ pip install -r requirements.txt
 
 ---
 
-### Running the Pipeline
+### B. Wandb Dashboard
+
+All run data, including profiling details, is available in our public Weights & Biases report [here](https://wandb.ai/multi-answer-spec-decoding/pipeline-profiling/reports/Experiment-Data--VmlldzoxMjY4NTAxNw?accessToken=sq40o4vb87nn8q0nsb2itye70gcwankbzh0l0zsk1rl875u5uwgpd88n4xecaw49).
+
+---
+
+### C. Running Inference Pipeline
 
 Streaminator evaluates `Llama 3.2B-Instruct` on GSM8K. Example:
 
@@ -104,9 +122,7 @@ python main.py \
 
 ---
 
-## Reproducing Experiments
-
-All run data, including profiling details, is available in our public Weights & Biases report [here](https://wandb.ai/multi-answer-spec-decoding/pipeline-profiling/reports/Experiment-Data--VmlldzoxMjY4NTAxNw?accessToken=sq40o4vb87nn8q0nsb2itye70gcwankbzh0l0zsk1rl875u5uwgpd88n4xecaw49).
+### E. Quickstart: Minimum Reproducible Result
 
 To regenerate the data run:
 
@@ -114,3 +130,11 @@ To regenerate the data run:
 ./acceptance_rates_plots.sh    # Acceptance rate experiments
 ./profiling_plots.sh           # GPU profiling experiments
 ```
+
+---
+
+## 5. Notes
+- Contact Information:
+  - Paul Kroeger: pk2819@columbia.edu
+  - Dylan Sattow: dms2315@columbia.edu
+  - Xuan Jiang: xj2315@columbia.edu
